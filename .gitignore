@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.so
+*.spv
+*.safetensors
+*.gguf
+*.bin
+*.log
+.env
+.env.*
+llama_argmax500
+usage_stats.json
+spv/
+spv_batch/
+spv_prefill/
