@@ -86,7 +86,7 @@ class ContinuousBatchScheduler:
         if not model_path.is_file() or not tok_path.is_file():
             raise FileNotFoundError(
                 f"Inkling-2-Mini weights not found in {model_dir}.\n"
-                f"Download them with:\n  hf download thinkingmachineslab/Inkling-2-Mini --local-dir {model_dir}"
+                f"Download them with:\n  hf download thinkingmachines/Inkling-2-Mini --local-dir {model_dir}"
             )
         self.tok = Tokenizer.from_file(str(tok_path))
         self.eng = BatchedVulkanEngine(str(model_path))

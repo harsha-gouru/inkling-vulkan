@@ -1,6 +1,6 @@
 # Inkling-2-Mini Raw Vulkan Engine & Server (RDNA 4 / R9700)
 
-Standalone inference engine and OpenAI-compatible continuous-batching server for Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinkingmachineslab/Inkling-2-Mini)** (Apache 2.0) on AMD Radeon AI PRO R9700 (32 GiB VRAM, RADV GFX1201).
+Standalone inference engine and OpenAI-compatible continuous-batching server for Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (Apache 2.0) on AMD Radeon AI PRO R9700 (32 GiB VRAM, RADV GFX1201).
 
 **Zero re-quantization:** reads the exact published safetensors weights (`NVFP4` layers 0–19, `MXFP8` layers 20–23, `BF16` dense/attention/unembed) directly on GPU with a pure **F32** KV cache and attention path.
 
@@ -26,7 +26,7 @@ pip install -r requirements.txt
 ### 2. Download Model Weights
 Weights are published by Thinking Machines Lab under the Apache 2.0 license:
 ```bash
-hf download thinkingmachineslab/Inkling-2-Mini --local-dir ./Inkling-2-Mini
+hf download thinkingmachines/Inkling-2-Mini --local-dir ./Inkling-2-Mini
 ```
 
 ### 3. Build Native Libraries & SPIR-V Shaders
@@ -53,4 +53,4 @@ You can also pass `--model-dir /path/to/Inkling-2-Mini` instead of `INKLING_MODE
 
 ## Attribution & License
 - Engine & server code: [Apache License 2.0](LICENSE).
-- Model architecture & weights: **[Inkling-2-Mini](https://huggingface.co/thinkingmachineslab/Inkling-2-Mini)** by Thinking Machines Lab, released under the Apache License 2.0.
+- Model architecture & weights: **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** by Thinking Machines Lab, released under the Apache License 2.0.
