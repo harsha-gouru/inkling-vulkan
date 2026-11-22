@@ -336,6 +336,75 @@ int vk_zero_buffer(int buf_id) {
     return 0;
 }
 
+int vk_copy_batch(int n_ops, const int *dst_bufs, const uint64_t *dst_offs,
+                  const int *src_bufs, const uint64_t *src_offs, const uint64_t *sizes) {
+    if (n_ops <= 0) return 0;
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(g_cmd_once, &bi));
+    for (int i = 0; i < n_ops; i++) {
+        if (sizes[i] == 0) continue;
+        VkBufferCopy reg = { src_offs[i], dst_offs[i], sizes[i] };
+        vkCmdCopyBuffer(g_cmd_once, g_bufs[src_bufs[i]].buf, g_bufs[dst_bufs[i]].buf, 1, &reg);
+    }
+    VK_CHECK(vkEndCommandBuffer(g_cmd_once));
+    VK_CHECK(vkResetFences(g_dev, 1, &g_fence));
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_cmd_once;
+    VK_CHECK(vkQueueSubmit(g_queue, 1, &si, g_fence));
+    VK_CHECK(vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX));
+    return 0;
+}
+
+#include <math.h>
+
+static inline uint8_t f32_to_fp8_e4m3(float x) {
+    if (x > 448.0f) x = 448.0f;
+    if (x < -448.0f) x = -448.0f;
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    uint8_t sign = (uint8_t)((bits >> 24) & 0x80u);
+    uint32_t abits = bits & 0x7FFFFFFFu;
+    if (abits < 0x3C800000u) {
+        float ax;
+        memcpy(&ax, &abits, 4);
+        uint32_t q = (uint32_t)lrintf(ax * 512.0f);
+        if (q > 8u) q = 8u;
+        return sign | (uint8_t)q;
+    }
+    uint32_t exp_m = abits - (120u << 23);
+    uint32_t lsb = (exp_m >> 20) & 1u;
+    uint32_t rounded = (exp_m + 0x7FFFFu + lsb) >> 20;
+    if (rounded > 0x7Eu) rounded = 0x7Eu;
+    return sign | (uint8_t)rounded;
+}
+
+void vk_quant_bf16_to_fp8(const uint16_t *src, uint8_t *dst_q, float *dst_sc, int n_rows, int n_cols) {
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < n_rows; r++) {
+        const uint16_t *row_in = src + (size_t)r * n_cols;
+        uint8_t *row_out = dst_q + (size_t)r * n_cols;
+        uint32_t max_u16 = 0;
+        for (int c = 0; c < n_cols; c++) {
+            uint32_t a = row_in[c] & 0x7FFFu;
+            if (a > max_u16) max_u16 = a;
+        }
+        uint32_t amax_bits = max_u16 << 16;
+        float amax;
+        memcpy(&amax, &amax_bits, 4);
+        float sc = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+        dst_sc[r] = sc;
+        float inv_sc = 1.0f / sc;
+        for (int c = 0; c < n_cols; c++) {
+            uint32_t fbits = ((uint32_t)row_in[c]) << 16;
+            float w;
+            memcpy(&w, &fbits, 4);
+            row_out[c] = f32_to_fp8_e4m3(w * inv_sc);
+        }
+    }
+}
+
 void *vk_get_mapped(int buf_id) {
     return g_bufs[buf_id].mapped;
 }

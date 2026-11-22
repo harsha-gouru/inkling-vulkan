@@ -1,7 +1,11 @@
 import os, shutil, sys, wgpu
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_batched_spv import FAST_COMMON, B_ATTN_SK
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR))
+from build_batched_spv import (
+    FAST_COMMON, B_RMS, B_COPY, B_MIX, B_MIX_RMS, B_RMS3,
+    B_CTRL_P1, B_CTRL_P2, B_CTRL3_P1, B_CTRL3_P2, B_GEMM, B_ATTN_SK, B_ATTN_CB, B_ROUTER
+)
 
 # ==============================================================================
 # Chunked Prefill Shaders (C up to 64 tokens of ONE sequence seq_slot!)
@@ -15,7 +19,7 @@ from build_batched_spv import FAST_COMMON, B_ATTN_SK
 
 # 1. Parallel 4-tap causal K/V short-conv + Q/R clip + write ALL C K/V to cache FIRST (Way 1)!
 # Dispatch: (64, C, 1)
-P_QKVR_POST = """
+P_QKVR_POST = FAST_COMMON + """
 @group(0) @binding(0) var<storage, read_write> QRSG: array<f32>;   // [C, 8600]
 @group(0) @binding(1) var<storage, read> Kraw: array<f32>;         // [C, 1056]
 @group(0) @binding(2) var<storage, read> Vraw: array<f32>;         // [C, 1056]
@@ -25,10 +29,10 @@ P_QKVR_POST = """
 @group(0) @binding(6) var<storage, read> VConv: array<f32>;
 @group(0) @binding(7) var<storage, read> HistKIn: array<f32>;      // [16, 48, 3, 1024] (read-only during conv!)
 @group(0) @binding(8) var<storage, read> HistVIn: array<f32>;      // [16, 48, 3, 1024]
-@group(0) @binding(9) var<storage, read_write> KCache0: array<f32>;
-@group(0) @binding(10) var<storage, read_write> KCache1: array<f32>;
-@group(0) @binding(11) var<storage, read_write> VCache0: array<f32>;
-@group(0) @binding(12) var<storage, read_write> VCache1: array<f32>;
+@group(0) @binding(9) var<storage, read_write> KCache0: array<u32>;
+@group(0) @binding(10) var<storage, read_write> KCache1: array<u32>;
+@group(0) @binding(11) var<storage, read_write> VCache0: array<u32>;
+@group(0) @binding(12) var<storage, read_write> VCache1: array<u32>;
 @group(0) @binding(13) var<storage, read> Meta: array<u32>;        // [0]=C, [1]=seq_slot, [2]=start_pos
 @group(0) @binding(14) var<uniform> params: vec4<u32>;             // x=(l_slot<<8)|cache_idx, y=is_full, z=k_off, w=v_off
 
@@ -127,18 +131,30 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let sq_sum = subgroupAdd(sq);
     let mult = select(min(1.0, 22.627416997969522 / (sqrt(sq_sum) + 1e-6)), inverseSqrt(sq_sum / 128.0 + 1e-6), is_v == 1u);
 
-    let half_slot = seq_slot & 7u;
+    let seq_cap = Meta[14];
+    let half_b = Meta[15];
+    let hi = (seq_slot >= half_b);
+    let half_slot = select(seq_slot, seq_slot - half_b, hi);
     let n_layers = select(40u, 8u, is_full == 1u);
-    let cap = select(1024u, 4096u, is_full == 1u);
+    let cap = select(1024u, seq_cap, is_full == 1u);
     let pos_phys = select(pos & 1023u, pos, is_full == 1u);
-    let c_off = ((half_slot * n_layers + cache_idx) * cap + pos_phys) * 1024u + head * 128u;
-    let o0 = vals[tid] * mult; let o1 = vals[tid + 64u] * mult;
-    if (is_v == 0u) {
-        if (seq_slot < 8u) { KCache0[c_off + tid] = o0; KCache0[c_off + tid + 64u] = o1; }
-        else               { KCache1[c_off + tid] = o0; KCache1[c_off + tid + 64u] = o1; }
-    } else {
-        if (seq_slot < 8u) { VCache0[c_off + tid] = o0; VCache0[c_off + tid + 64u] = o1; }
-        else               { VCache1[c_off + tid] = o0; VCache1[c_off + tid + 64u] = o1; }
+    let mult_s = mult * select(16.0, 32.0, is_v == 1u);
+    vals[tid] = vals[tid] * mult_s;
+    vals[tid + 64u] = vals[tid + 64u] * mult_s;
+    workgroupBarrier();
+    if (tid < 32u) {
+        let c_off = ((half_slot * n_layers + cache_idx) * cap + pos_phys) * 256u + head * 32u;
+        let packed = encode_fp8(vals[tid])
+                   | (encode_fp8(vals[tid + 32u]) << 8u)
+                   | (encode_fp8(vals[tid + 64u]) << 16u)
+                   | (encode_fp8(vals[tid + 96u]) << 24u);
+        if (is_v == 0u) {
+            if (!hi) { KCache0[c_off + tid] = packed; }
+            else     { KCache1[c_off + tid] = packed; }
+        } else {
+            if (!hi) { VCache0[c_off + tid] = packed; }
+            else     { VCache1[c_off + tid] = packed; }
+        }
     }
 }
 """
@@ -200,27 +216,37 @@ P_ATTN_SK = B_ATTN_SK.replace("let seq_slot = Meta[16u + bi];\n    let pos = Met
 # First computes all C outputs (reading Hist read-only), then P_SHIFT_2304_HIST updates Hist!
 # Dispatch: (9, C, 1)
 P_CONV_RESID = """
-@group(0) @binding(0) var<storage, read> X: array<f32>;        // [C, 2304]
+@group(0) @binding(0) var<storage, read> X: array<f32>;            // [C, 2304]
 @group(0) @binding(1) var<storage, read> ConvW: array<f32>;
-@group(0) @binding(2) var<storage, read> Resid: array<f32>;    // [C, 2304]
-@group(0) @binding(3) var<storage, read> Hist: array<f32>;     // [16, 48, 3, 2304]
-@group(0) @binding(4) var<storage, read_write> Out: array<f32>;// [C, 2304]
+@group(0) @binding(2) var<storage, read> Resid: array<f32>;        // [C, 2304]
+@group(0) @binding(3) var<storage, read_write> Hist: array<f32>;   // [16, 48, 3, 2304] (fused shift!)
+@group(0) @binding(4) var<storage, read_write> Out: array<f32>;    // [C, 2304]
 @group(0) @binding(5) var<storage, read> Meta: array<u32>;
-@group(0) @binding(6) var<uniform> params: vec4<u32>;          // x=l_slot, y=add_resid
+@group(0) @binding(6) var<uniform> params: vec4<u32>;              // x=l_slot, y=add_resid
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let bi = wg.y; let C = Meta[0];
-    if (bi >= C) { return; }
     let c = wg.x * 256u + lid.x;
     if (c >= 2304u) { return; }
+    let C = Meta[0];
     let hb = (Meta[1] * 48u + params.x) * 6912u;
-    let x3 = X[bi * 2304u + c];
-    let x2 = select(Hist[hb + 4608u + c], X[(bi - 1u) * 2304u + c], bi >= 1u);
-    let x1 = select(Hist[hb + (1u + bi) * 2304u + c], X[(bi - 2u) * 2304u + c], bi >= 2u);
-    let x0 = select(Hist[hb + bi * 2304u + c], X[(bi - 3u) * 2304u + c], bi >= 3u);
-    let y = (x3 + x0*ConvW[c*4u] + x1*ConvW[c*4u+1u] + x2*ConvW[c*4u+2u] + x3*ConvW[c*4u+3u]) * 0.4472135954999579;
-    let ob = bi * 2304u + c;
-    Out[ob] = select(y, y + Resid[ob], params.y == 1u);
+    var x0 = Hist[hb + c];
+    var x1 = Hist[hb + 2304u + c];
+    var x2 = Hist[hb + 4608u + c];
+    let cw0 = ConvW[c * 4u];
+    let cw1 = ConvW[c * 4u + 1u];
+    let cw2 = ConvW[c * 4u + 2u];
+    let cw3 = ConvW[c * 4u + 3u];
+    let add_r = (params.y == 1u);
+    for (var bi: u32 = 0u; bi < C; bi++) {
+        let ob = bi * 2304u + c;
+        let x3 = X[ob];
+        let y = (x3 + x0 * cw0 + x1 * cw1 + x2 * cw2 + x3 * cw3) * 0.4472135954999579;
+        Out[ob] = select(y, y + Resid[ob], add_r);
+        x0 = x1; x1 = x2; x2 = x3;
+    }
+    Hist[hb + c] = x0;
+    Hist[hb + 2304u + c] = x1;
+    Hist[hb + 4608u + c] = x2;
 }
 """
 
@@ -247,9 +273,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 # Scans Eids[0..C-1, 0..7] -> writes ExpCnt[e] and ExpToks[e * 64 + k] = (tok << 3) | slot!
 P_GROUP_EXPERTS = """
 @group(0) @binding(0) var<storage, read> Eids: array<u32>;        // [C, 8]
-@group(0) @binding(1) var<storage, read_write> ExpCnt: array<u32>; // [128]
+@group(0) @binding(1) var<storage, read_write> ExpCnt: array<u32>; // [128] -> compacted (eid << 8) | cnt
 @group(0) @binding(2) var<storage, read_write> ExpToks: array<u32>;// [128, 64] -> (tok << 3) | slot
 @group(0) @binding(3) var<storage, read> Meta: array<u32>;         // Meta[0] = C
+var<workgroup> sh_act: array<u32, 128>;
+var<workgroup> sh_out: array<u32, 128>;
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let e = lid.x;
@@ -264,7 +292,19 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             }
         }
     }
-    ExpCnt[e] = cnt;
+    let packed = select(0u, (e << 8u) | cnt, cnt > 0u);
+    sh_act[e] = packed;
+    sh_out[e] = 0u;
+    workgroupBarrier();
+    if (cnt > 0u) {
+        var pos: u32 = 0u;
+        for (var j: u32 = 0u; j < e; j++) {
+            if (sh_act[j] != 0u) { pos += 1u; }
+        }
+        sh_out[pos] = packed;
+    }
+    workgroupBarrier();
+    ExpCnt[e] = sh_out[e];
 }
 """
 
@@ -281,9 +321,10 @@ P_NV_W13_GRP = FAST_COMMON + """
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let eid = wg.y;
-    let cnt = ExpCnt[eid];
+    let pk_ec = ExpCnt[wg.y];
+    let cnt = pk_ec & 0xFFu;
     if (cnt == 0u) { return; }
+    let eid = pk_ec >> 8u;
     let tid = lid.x; let sub = tid >> 6u; let lane = tid & 63u;
     let r = wg.x * 2u + sub;
     let row_g = 2u * r;
@@ -351,9 +392,10 @@ P_NV_W2_GRP = FAST_COMMON + """
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let eid = wg.y;
-    let cnt = ExpCnt[eid];
+    let pk_ec = ExpCnt[wg.y];
+    let cnt = pk_ec & 0xFFu;
     if (cnt == 0u) { return; }
+    let eid = pk_ec >> 8u;
     let tid = lid.x; let sub = tid >> 6u; let lane = tid & 63u;
     let row = wg.x * 2u + sub;
     let w_base = (eid * 2304u + row) * 72u;
@@ -406,9 +448,10 @@ P_MX_W13_GRP = FAST_COMMON + """
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let eid = wg.y;
-    let cnt = ExpCnt[eid];
+    let pk_ec = ExpCnt[wg.y];
+    let cnt = pk_ec & 0xFFu;
     if (cnt == 0u) { return; }
+    let eid = pk_ec >> 8u;
     let tid = lid.x; let sub = tid >> 6u; let lane = tid & 63u;
     let r = wg.x * 2u + sub; let row_g = 2u * r;
     let wg_base = (eid * 2304u + row_g) * 144u; let wu_base = wg_base + 144u;
@@ -476,9 +519,10 @@ P_MX_W2_GRP = FAST_COMMON + """
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let eid = wg.y;
-    let cnt = ExpCnt[eid];
+    let pk_ec = ExpCnt[wg.y];
+    let cnt = pk_ec & 0xFFu;
     if (cnt == 0u) { return; }
+    let eid = pk_ec >> 8u;
     let tid = lid.x; let sub = tid >> 6u; let lane = tid & 63u;
     let row = wg.x * 2u + sub;
     let w_base = (eid * 2304u + row) * 72u;

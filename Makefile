@@ -1,7 +1,7 @@
 CC ?= gcc
-CFLAGS ?= -O3 -fPIC
+CFLAGS ?= -O3 -fopenmp -march=native -fPIC
 CPPFLAGS ?= $(shell pkg-config --cflags vulkan 2>/dev/null)
-LDFLAGS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo -lvulkan)
+LDFLAGS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo -lvulkan) -lm -fopenmp
 PYTHON ?= python3
 
 .PHONY: all shaders clean
@@ -15,10 +15,11 @@ libdump_spv.so: dump_spv.c
 	$(CC) $(CPPFLAGS) -O2 -fPIC -shared $< -o $@
 
 shaders: libdump_spv.so VK_LAYER_DUMP_SPV.json
-	mkdir -p spv_batch spv_prefill
-	VK_LAYER_PATH=$(CURDIR) VK_INSTANCE_LAYERS=VK_LAYER_DUMP_SPV DUMP_SPV_DIR=$(CURDIR)/spv_batch $(PYTHON) build_batched_spv.py
-	VK_LAYER_PATH=$(CURDIR) VK_INSTANCE_LAYERS=VK_LAYER_DUMP_SPV DUMP_SPV_DIR=$(CURDIR)/spv_prefill $(PYTHON) build_prefill_spv.py
+	mkdir -p spv_batch spv_prefill spv_dspark
+	VK_ADD_LAYER_PATH=$(CURDIR) VK_LAYER_PATH=$(CURDIR) VK_INSTANCE_LAYERS=VK_LAYER_DUMP_SPV DUMP_SPV_DIR=$(CURDIR)/spv_batch $(PYTHON) build_batched_spv.py
+	VK_ADD_LAYER_PATH=$(CURDIR) VK_LAYER_PATH=$(CURDIR) VK_INSTANCE_LAYERS=VK_LAYER_DUMP_SPV DUMP_SPV_DIR=$(CURDIR)/spv_prefill $(PYTHON) build_prefill_spv.py
+	VK_ADD_LAYER_PATH=$(CURDIR) VK_LAYER_PATH=$(CURDIR) VK_INSTANCE_LAYERS=VK_LAYER_DUMP_SPV DUMP_SPV_DIR=$(CURDIR)/spv_dspark $(PYTHON) build_dspark_spv.py
 
 clean:
 	rm -f libvk_inkling.so libdump_spv.so llama_argmax500
-	rm -rf spv_batch spv_prefill __pycache__
+	rm -rf spv_batch spv_prefill spv_dspark __pycache__

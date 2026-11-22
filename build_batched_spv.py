@@ -1,4 +1,7 @@
-import os, shutil, wgpu
+import os, shutil, sys, wgpu
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR))
 
 FAST_COMMON = """
 const E2M1 = array<f32, 16>(
@@ -11,6 +14,20 @@ fn decode_fp8(b: u32) -> f32 {
     let norm = bitcast<f32>(s | ((em + 960u) << 20u));
     let sub  = bitcast<f32>(s | bitcast<u32>(f32(em) * 0.001953125));
     return select(norm, sub, em < 8u);
+}
+fn encode_fp8(x: f32) -> u32 {
+    let cx = clamp(x, -448.0, 448.0);
+    let bits = bitcast<u32>(cx);
+    let sign = (bits >> 24u) & 0x80u;
+    let abits = bits & 0x7FFFFFFFu;
+    if (abits < 0x3C800000u) {
+        let q = u32(round(abs(cx) * 512.0));
+        return sign | min(q, 8u);
+    }
+    let exp_m = abits - (120u << 23u);
+    let lsb = (exp_m >> 20u) & 1u;
+    let rounded = (exp_m + 0x7FFFFu + lsb) >> 20u;
+    return sign | min(rounded, 0x7Eu);
 }
 fn decode_ue8m0(b: u32) -> f32 { return bitcast<f32>(b << 23u); }
 fn dot8_nvfp4(packed: u32, x0: vec4<f32>, x1: vec4<f32>) -> f32 {
@@ -230,31 +247,59 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }
 """
 
-# 6-9. Batched Control Gates (wg.z = b):
+# 6-9. Batched Control Gates (8-way batch tiled wg.z = (B+7)/8 + 32x coalesced transposed Wg/Wf [32, 2304]!):
 B_CTRL_P1 = """
 @group(0) @binding(0) var<storage, read> Cur: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read> Msg: array<vec2<f32>>;
 @group(0) @binding(2) var<storage, read> Wd: array<u32>;
 @group(0) @binding(3) var<storage, read_write> Gate: array<f32>;
-@group(0) @binding(4) var<uniform> params: vec4<u32>; // x=cur_off_v2, y=msg_off_v2
+@group(0) @binding(4) var<uniform> params: vec4<u32>; // x=cur_off_v2, y=msg_off_v2, z=B
+var<workgroup> inv_cm: array<f32, 16>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let r = wg.x; let bi = wg.z; let tid = lid.x;
+    let r = wg.x; let b0 = wg.z * 8u; let tid = lid.x;
+    let B = max(1u, params.z);
+    if (b0 >= B) { return; }
+    let cnt = min(8u, B - b0);
     let base = r * 2304u;
-    let c_off = bi * 1152u + params.x;
-    let m_off = bi * 4608u + params.y;
-    var sq_c: f32 = 0.0; var sq_m: f32 = 0.0; var dc: f32 = 0.0; var dm: f32 = 0.0;
-    for (var k = tid; k < 1152u; k += 64u) {
-        let c = Cur[c_off + k]; let m = Msg[m_off + k];
-        sq_c += dot(c, c); sq_m += dot(m, m);
-        let wc = Wd[base + k]; let wm = Wd[base + 1152u + k];
-        dc += bitcast<f32>((wc & 0xFFFFu) << 16u) * c.x + bitcast<f32>(wc & 0xFFFF0000u) * c.y;
-        dm += bitcast<f32>((wm & 0xFFFFu) << 16u) * m.x + bitcast<f32>(wm & 0xFFFF0000u) * m.y;
+    for (var j: u32 = 0u; j < cnt; j++) {
+        let bi = b0 + j;
+        let c_off = bi * 1152u + params.x;
+        let m_off = bi * 4608u + params.y;
+        var sq_c: f32 = 0.0; var sq_m: f32 = 0.0;
+        for (var k = tid; k < 1152u; k += 64u) {
+            let c = Cur[c_off + k]; let m = Msg[m_off + k];
+            sq_c += dot(c, c); sq_m += dot(m, m);
+        }
+        let ic = inverseSqrt(subgroupAdd(sq_c) / 2304.0 + 1e-6);
+        let im = inverseSqrt(subgroupAdd(sq_m) / 2304.0 + 1e-6);
+        if (tid == 0u) { inv_cm[j] = ic; inv_cm[8u + j] = im; }
     }
-    let inv_c = inverseSqrt(subgroupAdd(sq_c) / 2304.0 + 1e-6);
-    let inv_m = inverseSqrt(subgroupAdd(sq_m) / 2304.0 + 1e-6);
-    let tot = subgroupAdd(dc * inv_c + dm * inv_m);
-    if (tid == 0u) { Gate[bi * 192u + r] = tot; }
+    workgroupBarrier();
+    var dc0: f32=0.0; var dm0: f32=0.0; var dc1: f32=0.0; var dm1: f32=0.0;
+    var dc2: f32=0.0; var dm2: f32=0.0; var dc3: f32=0.0; var dm3: f32=0.0;
+    var dc4: f32=0.0; var dm4: f32=0.0; var dc5: f32=0.0; var dm5: f32=0.0;
+    var dc6: f32=0.0; var dm6: f32=0.0; var dc7: f32=0.0; var dm7: f32=0.0;
+    for (var k = tid; k < 1152u; k += 64u) {
+        let wc_u = Wd[base + k]; let wm_u = Wd[base + 1152u + k];
+        let wc = vec2<f32>(bitcast<f32>((wc_u & 0xFFFFu) << 16u), bitcast<f32>(wc_u & 0xFFFF0000u));
+        let wm = vec2<f32>(bitcast<f32>((wm_u & 0xFFFFu) << 16u), bitcast<f32>(wm_u & 0xFFFF0000u));
+        { let bi = b0; dc0 += dot(wc, Cur[bi*1152u+params.x+k]); dm0 += dot(wm, Msg[bi*4608u+params.y+k]); }
+        if (cnt > 1u) { let bi = b0+1u; dc1 += dot(wc, Cur[bi*1152u+params.x+k]); dm1 += dot(wm, Msg[bi*4608u+params.y+k]); }
+        if (cnt > 2u) { let bi = b0+2u; dc2 += dot(wc, Cur[bi*1152u+params.x+k]); dm2 += dot(wm, Msg[bi*4608u+params.y+k]); }
+        if (cnt > 3u) { let bi = b0+3u; dc3 += dot(wc, Cur[bi*1152u+params.x+k]); dm3 += dot(wm, Msg[bi*4608u+params.y+k]); }
+        if (cnt > 4u) { let bi = b0+4u; dc4 += dot(wc, Cur[bi*1152u+params.x+k]); dm4 += dot(wm, Msg[bi*4608u+params.y+k]); }
+        if (cnt > 5u) { let bi = b0+5u; dc5 += dot(wc, Cur[bi*1152u+params.x+k]); dm5 += dot(wm, Msg[bi*4608u+params.y+k]); }
+        if (cnt > 6u) { let bi = b0+6u; dc6 += dot(wc, Cur[bi*1152u+params.x+k]); dm6 += dot(wm, Msg[bi*4608u+params.y+k]); }
+        if (cnt > 7u) { let bi = b0+7u; dc7 += dot(wc, Cur[bi*1152u+params.x+k]); dm7 += dot(wm, Msg[bi*4608u+params.y+k]); }
+    }
+    var dcs = array<f32,8>(subgroupAdd(dc0*inv_cm[0]+dm0*inv_cm[8]),subgroupAdd(dc1*inv_cm[1]+dm1*inv_cm[9]),subgroupAdd(dc2*inv_cm[2]+dm2*inv_cm[10]),subgroupAdd(dc3*inv_cm[3]+dm3*inv_cm[11]),subgroupAdd(dc4*inv_cm[4]+dm4*inv_cm[12]),subgroupAdd(dc5*inv_cm[5]+dm5*inv_cm[13]),subgroupAdd(dc6*inv_cm[6]+dm6*inv_cm[14]),subgroupAdd(dc7*inv_cm[7]+dm7*inv_cm[15]));
+    var dms = array<f32,8>(subgroupAdd(dm0),subgroupAdd(dm1),subgroupAdd(dm2),subgroupAdd(dm3),subgroupAdd(dm4),subgroupAdd(dm5),subgroupAdd(dm6),subgroupAdd(dm7));
+    if (tid == 0u) {
+        for (var j: u32 = 0u; j < cnt; j++) {
+            Gate[(b0 + j) * 192u + r] = dcs[j];
+        }
+    }
 }
 """
 
@@ -265,26 +310,47 @@ B_CTRL_P2 = """
 @group(0) @binding(3) var<storage, read> Wg: array<u32>;
 @group(0) @binding(4) var<storage, read> Wf: array<u32>;
 @group(0) @binding(5) var<storage, read_write> Out: array<f32>;
-@group(0) @binding(6) var<uniform> params: vec4<u32>; // x=cur_off, y=msg_off, z=out_off
-var<workgroup> s_gate: array<f32, 64>;
+@group(0) @binding(6) var<uniform> params: vec4<u32>; // x=cur_off, y=msg_off, z=out_off, w=B
+var<workgroup> s_gate: array<f32, 512>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let bi = wg.z;
-    s_gate[lid.x] = Gate[bi * 192u + lid.x];
-    workgroupBarrier();
-    let r = wg.x * 64u + lid.x;
-    if (r >= 2304u) { return; }
-    let base = r * 32u;
-    var g: f32 = 0.0; var f: f32 = 0.0;
-    for (var j: u32 = 0u; j < 32u; j++) {
-        let wg_w = Wg[base + j]; let wf_w = Wf[base + j];
-        let x0 = s_gate[2u * j]; let x1 = s_gate[2u * j + 1u];
-        g += bitcast<f32>((wg_w & 0xFFFFu) << 16u) * x0 + bitcast<f32>(wg_w & 0xFFFF0000u) * x1;
-        f += bitcast<f32>((wf_w & 0xFFFFu) << 16u) * x0 + bitcast<f32>(wf_w & 0xFFFF0000u) * x1;
+    let b0 = wg.z * 8u; let tid = lid.x;
+    let B = max(1u, params.w);
+    if (b0 >= B) { return; }
+    let cnt = min(8u, B - b0);
+    for (var j: u32 = 0u; j < cnt; j++) {
+        s_gate[j * 64u + tid] = Gate[(b0 + j) * 192u + tid];
     }
-    let c = Cur[bi * 2304u + params.x + r];
-    let m = Msg[bi * 9216u + params.y + r];
-    Out[bi * 2304u + params.z + r] = c - tanh(f) * c + tanh(g) * m;
+    workgroupBarrier();
+    let r = wg.x * 64u + tid;
+    if (r >= 2304u) { return; }
+    var g0: f32=0.0; var f0: f32=0.0; var g1: f32=0.0; var f1: f32=0.0;
+    var g2: f32=0.0; var f2: f32=0.0; var g3: f32=0.0; var f3: f32=0.0;
+    var g4: f32=0.0; var f4: f32=0.0; var g5: f32=0.0; var f5: f32=0.0;
+    var g6: f32=0.0; var f6: f32=0.0; var g7: f32=0.0; var f7: f32=0.0;
+    for (var j: u32 = 0u; j < 32u; j++) {
+        let idx = j * 2304u + r;
+        let wg_u = Wg[idx]; let wf_u = Wf[idx];
+        let wg0 = bitcast<f32>((wg_u & 0xFFFFu) << 16u); let wg1 = bitcast<f32>(wg_u & 0xFFFF0000u);
+        let wf0 = bitcast<f32>((wf_u & 0xFFFFu) << 16u); let wf1 = bitcast<f32>(wf_u & 0xFFFF0000u);
+        let j2 = 2u * j;
+        { let x0 = s_gate[j2]; let x1 = s_gate[j2+1u]; g0 += wg0*x0 + wg1*x1; f0 += wf0*x0 + wf1*x1; }
+        if (cnt > 1u) { let x0 = s_gate[64u+j2];  let x1 = s_gate[64u+j2+1u];  g1 += wg0*x0 + wg1*x1; f1 += wf0*x0 + wf1*x1; }
+        if (cnt > 2u) { let x0 = s_gate[128u+j2]; let x1 = s_gate[128u+j2+1u]; g2 += wg0*x0 + wg1*x1; f2 += wf0*x0 + wf1*x1; }
+        if (cnt > 3u) { let x0 = s_gate[192u+j2]; let x1 = s_gate[192u+j2+1u]; g3 += wg0*x0 + wg1*x1; f3 += wf0*x0 + wf1*x1; }
+        if (cnt > 4u) { let x0 = s_gate[256u+j2]; let x1 = s_gate[256u+j2+1u]; g4 += wg0*x0 + wg1*x1; f4 += wf0*x0 + wf1*x1; }
+        if (cnt > 5u) { let x0 = s_gate[320u+j2]; let x1 = s_gate[320u+j2+1u]; g5 += wg0*x0 + wg1*x1; f5 += wf0*x0 + wf1*x1; }
+        if (cnt > 6u) { let x0 = s_gate[384u+j2]; let x1 = s_gate[384u+j2+1u]; g6 += wg0*x0 + wg1*x1; f6 += wf0*x0 + wf1*x1; }
+        if (cnt > 7u) { let x0 = s_gate[448u+j2]; let x1 = s_gate[448u+j2+1u]; g7 += wg0*x0 + wg1*x1; f7 += wf0*x0 + wf1*x1; }
+    }
+    var gs = array<f32,8>(g0,g1,g2,g3,g4,g5,g6,g7);
+    var fs = array<f32,8>(f0,f1,f2,f3,f4,f5,f6,f7);
+    for (var j: u32 = 0u; j < cnt; j++) {
+        let bi = b0 + j;
+        let c = Cur[bi * 2304u + params.x + r];
+        let m = Msg[bi * 9216u + params.y + r];
+        Out[bi * 2304u + params.z + r] = c - tanh(fs[j]) * c + tanh(gs[j]) * m;
+    }
 }
 """
 
@@ -293,25 +359,55 @@ B_CTRL3_P1 = """
 @group(0) @binding(1) var<storage, read> Msg: array<vec2<f32>>;
 @group(0) @binding(2) var<storage, read> Wd3: array<u32>;
 @group(0) @binding(3) var<storage, read_write> Gate3: array<f32>;
-@group(0) @binding(4) var<uniform> params: vec4<u32>; // x=cur_stride_v2 (0 or 1152)
+@group(0) @binding(4) var<uniform> params: vec4<u32>; // x=cur_stride_v2 (0 or 1152), y=B
+var<workgroup> inv_cm: array<f32, 16>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let r = wg.x; let c_idx = wg.y; let bi = wg.z; let tid = lid.x;
+    let r = wg.x; let c_idx = wg.y; let b0 = wg.z * 8u; let tid = lid.x;
+    let B = max(1u, params.y);
+    if (b0 >= B) { return; }
+    let cnt = min(8u, B - b0);
     let base = (c_idx * 64u + r) * 2304u;
-    let c_off = bi * 3456u + c_idx * params.x;
-    let m_off = bi * 4608u + c_idx * 1152u;
-    var sq_c: f32 = 0.0; var sq_m: f32 = 0.0; var dc: f32 = 0.0; var dm: f32 = 0.0;
-    for (var k = tid; k < 1152u; k += 64u) {
-        let c = Cur[c_off + k]; let m = Msg[m_off + k];
-        sq_c += dot(c, c); sq_m += dot(m, m);
-        let wc = Wd3[base + k]; let wm = Wd3[base + 1152u + k];
-        dc += bitcast<f32>((wc & 0xFFFFu) << 16u) * c.x + bitcast<f32>(wc & 0xFFFF0000u) * c.y;
-        dm += bitcast<f32>((wm & 0xFFFFu) << 16u) * m.x + bitcast<f32>(wm & 0xFFFF0000u) * m.y;
+    let c_str = c_idx * params.x;
+    let m_str = c_idx * 1152u;
+    for (var j: u32 = 0u; j < cnt; j++) {
+        let bi = b0 + j;
+        let c_off = bi * 3456u + c_str;
+        let m_off = bi * 4608u + m_str;
+        var sq_c: f32 = 0.0; var sq_m: f32 = 0.0;
+        for (var k = tid; k < 1152u; k += 64u) {
+            let c = Cur[c_off + k]; let m = Msg[m_off + k];
+            sq_c += dot(c, c); sq_m += dot(m, m);
+        }
+        let ic = inverseSqrt(subgroupAdd(sq_c) / 2304.0 + 1e-6);
+        let im = inverseSqrt(subgroupAdd(sq_m) / 2304.0 + 1e-6);
+        if (tid == 0u) { inv_cm[j] = ic; inv_cm[8u + j] = im; }
     }
-    let inv_c = inverseSqrt(subgroupAdd(sq_c) / 2304.0 + 1e-6);
-    let inv_m = inverseSqrt(subgroupAdd(sq_m) / 2304.0 + 1e-6);
-    let tot = subgroupAdd(dc * inv_c + dm * inv_m);
-    if (tid == 0u) { Gate3[bi * 192u + c_idx * 64u + r] = tot; }
+    workgroupBarrier();
+    var dc0: f32=0.0; var dm0: f32=0.0; var dc1: f32=0.0; var dm1: f32=0.0;
+    var dc2: f32=0.0; var dm2: f32=0.0; var dc3: f32=0.0; var dm3: f32=0.0;
+    var dc4: f32=0.0; var dm4: f32=0.0; var dc5: f32=0.0; var dm5: f32=0.0;
+    var dc6: f32=0.0; var dm6: f32=0.0; var dc7: f32=0.0; var dm7: f32=0.0;
+    for (var k = tid; k < 1152u; k += 64u) {
+        let wc_u = Wd3[base + k]; let wm_u = Wd3[base + 1152u + k];
+        let wc = vec2<f32>(bitcast<f32>((wc_u & 0xFFFFu) << 16u), bitcast<f32>(wc_u & 0xFFFF0000u));
+        let wm = vec2<f32>(bitcast<f32>((wm_u & 0xFFFFu) << 16u), bitcast<f32>(wm_u & 0xFFFF0000u));
+        { let bi = b0; dc0 += dot(wc, Cur[bi*3456u+c_str+k]); dm0 += dot(wm, Msg[bi*4608u+m_str+k]); }
+        if (cnt > 1u) { let bi = b0+1u; dc1 += dot(wc, Cur[bi*3456u+c_str+k]); dm1 += dot(wm, Msg[bi*4608u+m_str+k]); }
+        if (cnt > 2u) { let bi = b0+2u; dc2 += dot(wc, Cur[bi*3456u+c_str+k]); dm2 += dot(wm, Msg[bi*4608u+m_str+k]); }
+        if (cnt > 3u) { let bi = b0+3u; dc3 += dot(wc, Cur[bi*3456u+c_str+k]); dm3 += dot(wm, Msg[bi*4608u+m_str+k]); }
+        if (cnt > 4u) { let bi = b0+4u; dc4 += dot(wc, Cur[bi*3456u+c_str+k]); dm4 += dot(wm, Msg[bi*4608u+m_str+k]); }
+        if (cnt > 5u) { let bi = b0+5u; dc5 += dot(wc, Cur[bi*3456u+c_str+k]); dm5 += dot(wm, Msg[bi*4608u+m_str+k]); }
+        if (cnt > 6u) { let bi = b0+6u; dc6 += dot(wc, Cur[bi*3456u+c_str+k]); dm6 += dot(wm, Msg[bi*4608u+m_str+k]); }
+        if (cnt > 7u) { let bi = b0+7u; dc7 += dot(wc, Cur[bi*3456u+c_str+k]); dm7 += dot(wm, Msg[bi*4608u+m_str+k]); }
+    }
+    var dcs = array<f32,8>(subgroupAdd(dc0*inv_cm[0]+dm0*inv_cm[8]),subgroupAdd(dc1*inv_cm[1]+dm1*inv_cm[9]),subgroupAdd(dc2*inv_cm[2]+dm2*inv_cm[10]),subgroupAdd(dc3*inv_cm[3]+dm3*inv_cm[11]),subgroupAdd(dc4*inv_cm[4]+dm4*inv_cm[12]),subgroupAdd(dc5*inv_cm[5]+dm5*inv_cm[13]),subgroupAdd(dc6*inv_cm[6]+dm6*inv_cm[14]),subgroupAdd(dc7*inv_cm[7]+dm7*inv_cm[15]));
+    var dms = array<f32,8>(subgroupAdd(dm0),subgroupAdd(dm1),subgroupAdd(dm2),subgroupAdd(dm3),subgroupAdd(dm4),subgroupAdd(dm5),subgroupAdd(dm6),subgroupAdd(dm7));
+    if (tid == 0u) {
+        for (var j: u32 = 0u; j < cnt; j++) {
+            Gate3[(b0 + j) * 192u + c_idx * 64u + r] = dcs[j];
+        }
+    }
 }
 """
 
@@ -322,38 +418,61 @@ B_CTRL3_P2 = """
 @group(0) @binding(3) var<storage, read> Wg3: array<u32>;
 @group(0) @binding(4) var<storage, read> Wf3: array<u32>;
 @group(0) @binding(5) var<storage, read_write> Out3: array<f32>;
-@group(0) @binding(6) var<uniform> params: vec4<u32>; // x=cur_stride (0 or 2304)
-var<workgroup> s_gate: array<f32, 64>;
+@group(0) @binding(6) var<uniform> params: vec4<u32>; // x=cur_stride (0 or 2304), y=B
+var<workgroup> s_gate: array<f32, 512>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let c_idx = wg.y; let bi = wg.z;
-    s_gate[lid.x] = Gate3[bi * 192u + c_idx * 64u + lid.x];
-    workgroupBarrier();
-    let r = wg.x * 64u + lid.x;
-    if (r >= 2304u) { return; }
-    let base = (c_idx * 2304u + r) * 32u;
-    var g: f32 = 0.0; var f: f32 = 0.0;
-    for (var j: u32 = 0u; j < 32u; j++) {
-        let wg_w = Wg3[base + j]; let wf_w = Wf3[base + j];
-        let x0 = s_gate[2u * j]; let x1 = s_gate[2u * j + 1u];
-        g += bitcast<f32>((wg_w & 0xFFFFu) << 16u) * x0 + bitcast<f32>(wg_w & 0xFFFF0000u) * x1;
-        f += bitcast<f32>((wf_w & 0xFFFFu) << 16u) * x0 + bitcast<f32>(wf_w & 0xFFFF0000u) * x1;
+    let c_idx = wg.y; let b0 = wg.z * 8u; let tid = lid.x;
+    let B = max(1u, params.y);
+    if (b0 >= B) { return; }
+    let cnt = min(8u, B - b0);
+    for (var j: u32 = 0u; j < cnt; j++) {
+        s_gate[j * 64u + tid] = Gate3[(b0 + j) * 192u + c_idx * 64u + tid];
     }
-    let c = Cur[bi * 6912u + c_idx * params.x + r];
-    let m = Msg[bi * 9216u + c_idx * 2304u + r];
-    Out3[bi * 6912u + c_idx * 2304u + r] = c - tanh(f) * c + tanh(g) * m;
+    workgroupBarrier();
+    let r = wg.x * 64u + tid;
+    if (r >= 2304u) { return; }
+    let c_base = c_idx * 32u;
+    var g0: f32=0.0; var f0: f32=0.0; var g1: f32=0.0; var f1: f32=0.0;
+    var g2: f32=0.0; var f2: f32=0.0; var g3: f32=0.0; var f3: f32=0.0;
+    var g4: f32=0.0; var f4: f32=0.0; var g5: f32=0.0; var f5: f32=0.0;
+    var g6: f32=0.0; var f6: f32=0.0; var g7: f32=0.0; var f7: f32=0.0;
+    for (var j: u32 = 0u; j < 32u; j++) {
+        let idx = (c_base + j) * 2304u + r;
+        let wg_u = Wg3[idx]; let wf_u = Wf3[idx];
+        let wg0 = bitcast<f32>((wg_u & 0xFFFFu) << 16u); let wg1 = bitcast<f32>(wg_u & 0xFFFF0000u);
+        let wf0 = bitcast<f32>((wf_u & 0xFFFFu) << 16u); let wf1 = bitcast<f32>(wf_u & 0xFFFF0000u);
+        let j2 = 2u * j;
+        { let x0 = s_gate[j2]; let x1 = s_gate[j2+1u]; g0 += wg0*x0 + wg1*x1; f0 += wf0*x0 + wf1*x1; }
+        if (cnt > 1u) { let x0 = s_gate[64u+j2];  let x1 = s_gate[64u+j2+1u];  g1 += wg0*x0 + wg1*x1; f1 += wf0*x0 + wf1*x1; }
+        if (cnt > 2u) { let x0 = s_gate[128u+j2]; let x1 = s_gate[128u+j2+1u]; g2 += wg0*x0 + wg1*x1; f2 += wf0*x0 + wf1*x1; }
+        if (cnt > 3u) { let x0 = s_gate[192u+j2]; let x1 = s_gate[192u+j2+1u]; g3 += wg0*x0 + wg1*x1; f3 += wf0*x0 + wf1*x1; }
+        if (cnt > 4u) { let x0 = s_gate[256u+j2]; let x1 = s_gate[256u+j2+1u]; g4 += wg0*x0 + wg1*x1; f4 += wf0*x0 + wf1*x1; }
+        if (cnt > 5u) { let x0 = s_gate[320u+j2]; let x1 = s_gate[320u+j2+1u]; g5 += wg0*x0 + wg1*x1; f5 += wf0*x0 + wf1*x1; }
+        if (cnt > 6u) { let x0 = s_gate[384u+j2]; let x1 = s_gate[384u+j2+1u]; g6 += wg0*x0 + wg1*x1; f6 += wf0*x0 + wf1*x1; }
+        if (cnt > 7u) { let x0 = s_gate[448u+j2]; let x1 = s_gate[448u+j2+1u]; g7 += wg0*x0 + wg1*x1; f7 += wf0*x0 + wf1*x1; }
+    }
+    var gs = array<f32,8>(g0,g1,g2,g3,g4,g5,g6,g7);
+    var fs = array<f32,8>(f0,f1,f2,f3,f4,f5,f6,f7);
+    let c_off = c_idx * params.x + r;
+    let m_off = c_idx * 2304u + r;
+    for (var j: u32 = 0u; j < cnt; j++) {
+        let bi = b0 + j;
+        let c = Cur[bi * 6912u + c_off];
+        let m = Msg[bi * 9216u + m_off];
+        Out3[bi * 6912u + m_off] = c - tanh(fs[j]) * c + tanh(gs[j]) * m;
+    }
 }
 """
 
-# 10. SHARED-WEIGHT BF16 GEMM (8-way register tiled over batch!):
-# Loads W[row] ONCE and multiplies against up to 8 batch items (wg.y = tile of 8)!
-# Dispatch: ((N+1)/2, (B+7)/8, 1)
+# 10. SHARED-WEIGHT HYBRID FP8/BF16 GEMM (8-way register tiled over batch!):
+# dims.w == 0 -> FP8 E4M3 with inline tail f32 row scales; dims.w == 1 -> exact BF16 (for MoE router_w)
 B_GEMM = FAST_COMMON + """
 @group(0) @binding(0) var<storage, read> W: array<vec4<u32>>;
-@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;  // [B, K/4]
-@group(0) @binding(2) var<storage, read_write> Y: array<f32>;  // [B, Y_stride]
-@group(0) @binding(3) var<storage, read> Meta: array<u32>;     // Meta[0] = B
-@group(0) @binding(4) var<uniform> dims: vec4<u32>;            // x=K_v4 (288), y=N, z=Y_stride (8600, 1056, 128)
+@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(3) var<storage, read> Meta: array<u32>;
+@group(0) @binding(4) var<uniform> dims: vec4<u32>; // x=K_v4, y=N, z=Y_stride, w=is_bf16
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x; let sub = tid >> 6u; let lane = tid & 63u;
@@ -363,26 +482,47 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let b0 = wg.y * 8u; if (b0 >= B) { return; }
     let cnt = min(8u, B - b0);
     let K_v4 = dims.x;
-    let K_x = K_v4 * 2u; // vec4<f32> per user (576 for K=2304)
     let base = row * K_v4;
 
     var a0: f32 = 0.0; var a1: f32 = 0.0; var a2: f32 = 0.0; var a3: f32 = 0.0;
     var a4: f32 = 0.0; var a5: f32 = 0.0; var a6: f32 = 0.0; var a7: f32 = 0.0;
 
-    for (var k = lane; k < K_v4; k += 64u) {
-        let w = W[base + k];
-        let xk = k * 2u;
-        { let x0 = X[b0 * K_x + xk]; let x1 = X[b0 * K_x + xk + 1u]; a0 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 1u) { let o = (b0+1u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a1 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 2u) { let o = (b0+2u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a2 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 3u) { let o = (b0+3u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a3 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 4u) { let o = (b0+4u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a4 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 5u) { let o = (b0+5u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a5 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 6u) { let o = (b0+6u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a6 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 7u) { let o = (b0+7u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a7 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+    if (dims.w == 1u) {
+        let K_x = K_v4 * 2u;
+        for (var k = lane; k < K_v4; k += 64u) {
+            let w = W[base + k]; let xk = k * 2u;
+            { let x0 = X[b0 * K_x + xk]; let x1 = X[b0 * K_x + xk + 1u]; a0 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+            if (cnt > 1u) { let o = (b0+1u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a1 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+            if (cnt > 2u) { let o = (b0+2u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a2 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+            if (cnt > 3u) { let o = (b0+3u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a3 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+            if (cnt > 4u) { let o = (b0+4u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a4 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+            if (cnt > 5u) { let o = (b0+5u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a5 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+            if (cnt > 6u) { let o = (b0+6u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a6 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+            if (cnt > 7u) { let o = (b0+7u)*K_x+xk; let x0 = X[o]; let x1 = X[o+1u]; a7 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+        }
+    } else {
+        let K_x = K_v4 * 4u;
+        for (var k = lane; k < K_v4; k += 64u) {
+            let w = W[base + k]; let xk = k * 4u;
+            { let o = b0*K_x+xk; a0 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 1u) { let o = (b0+1u)*K_x+xk; a1 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 2u) { let o = (b0+2u)*K_x+xk; a2 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 3u) { let o = (b0+3u)*K_x+xk; a3 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 4u) { let o = (b0+4u)*K_x+xk; a4 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 5u) { let o = (b0+5u)*K_x+xk; a5 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 6u) { let o = (b0+6u)*K_x+xk; a6 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 7u) { let o = (b0+7u)*K_x+xk; a7 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        }
     }
-    let s0 = subgroupAdd(a0); let s1 = subgroupAdd(a1); let s2 = subgroupAdd(a2); let s3 = subgroupAdd(a3);
-    let s4 = subgroupAdd(a4); let s5 = subgroupAdd(a5); let s6 = subgroupAdd(a6); let s7 = subgroupAdd(a7);
+    var sc: f32 = 1.0;
+    if (dims.w == 0u) {
+        let sv4 = W[dims.y * K_v4 + (row >> 2u)];
+        let c_idx = row & 3u;
+        let su = select(select(sv4.x, sv4.y, c_idx == 1u), select(sv4.z, sv4.w, c_idx == 3u), c_idx >= 2u);
+        sc = bitcast<f32>(su);
+    }
+    let s0 = subgroupAdd(a0) * sc; let s1 = subgroupAdd(a1) * sc; let s2 = subgroupAdd(a2) * sc; let s3 = subgroupAdd(a3) * sc;
+    let s4 = subgroupAdd(a4) * sc; let s5 = subgroupAdd(a5) * sc; let s6 = subgroupAdd(a6) * sc; let s7 = subgroupAdd(a7) * sc;
     if (lane == 0u) {
         let ys = dims.z;
         Y[b0 * ys + row] = s0;
@@ -398,7 +538,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 """
 
 # 11. Batched QKVR_POST with split K0/K1/V0/V1 + SWA 1024 ring buffer + Full 4096!
-B_QKVR_POST = """
+B_QKVR_POST = FAST_COMMON + """
 @group(0) @binding(0) var<storage, read_write> QRSG: array<f32>;
 @group(0) @binding(1) var<storage, read> Kraw: array<f32>;
 @group(0) @binding(2) var<storage, read> Vraw: array<f32>;
@@ -408,10 +548,10 @@ B_QKVR_POST = """
 @group(0) @binding(6) var<storage, read> VConv: array<f32>;
 @group(0) @binding(7) var<storage, read_write> HistK: array<f32>;
 @group(0) @binding(8) var<storage, read_write> HistV: array<f32>;
-@group(0) @binding(9) var<storage, read_write> KCache0: array<f32>;
-@group(0) @binding(10) var<storage, read_write> KCache1: array<f32>;
-@group(0) @binding(11) var<storage, read_write> VCache0: array<f32>;
-@group(0) @binding(12) var<storage, read_write> VCache1: array<f32>;
+@group(0) @binding(9) var<storage, read_write> KCache0: array<u32>;
+@group(0) @binding(10) var<storage, read_write> KCache1: array<u32>;
+@group(0) @binding(11) var<storage, read_write> VCache0: array<u32>;
+@group(0) @binding(12) var<storage, read_write> VCache1: array<u32>;
 @group(0) @binding(13) var<storage, read> Meta: array<u32>;
 @group(0) @binding(14) var<uniform> params: vec4<u32>; // x=(l_slot<<8)|cache_idx, y=is_full(0=SWA1024,1=Full4096), z=k_off, w=v_off
 
@@ -490,36 +630,47 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let sq_sum = subgroupAdd(sq);
     let mult = select(min(1.0, 22.627416997969522 / (sqrt(sq_sum) + 1e-6)), inverseSqrt(sq_sum / 128.0 + 1e-6), is_v == 1u);
 
-    let half_slot = seq_slot & 7u;
+    let seq_cap = Meta[14];
+    let half_b = Meta[15];
+    let hi = (seq_slot >= half_b);
+    let half_slot = select(seq_slot, seq_slot - half_b, hi);
     let n_layers = select(40u, 8u, is_full == 1u);
-    let cap = select(1024u, 4096u, is_full == 1u);
+    let cap = select(1024u, seq_cap, is_full == 1u);
     let pos_phys = select(pos & 1023u, pos, is_full == 1u);
-    let c_off = ((half_slot * n_layers + cache_idx) * cap + pos_phys) * 1024u + head * 128u;
-    let o0 = vals[tid] * mult; let o1 = vals[tid + 64u] * mult;
-    if (is_v == 0u) {
-        if (seq_slot < 8u) { KCache0[c_off + tid] = o0; KCache0[c_off + tid + 64u] = o1; }
-        else               { KCache1[c_off + tid] = o0; KCache1[c_off + tid + 64u] = o1; }
-    } else {
-        if (seq_slot < 8u) { VCache0[c_off + tid] = o0; VCache0[c_off + tid + 64u] = o1; }
-        else               { VCache1[c_off + tid] = o0; VCache1[c_off + tid + 64u] = o1; }
+    let mult_s = mult * select(16.0, 32.0, is_v == 1u);
+    vals[tid] = vals[tid] * mult_s;
+    vals[tid + 64u] = vals[tid + 64u] * mult_s;
+    workgroupBarrier();
+    if (tid < 32u) {
+        let c_off = ((half_slot * n_layers + cache_idx) * cap + pos_phys) * 256u + head * 32u;
+        let packed = encode_fp8(vals[tid])
+                   | (encode_fp8(vals[tid + 32u]) << 8u)
+                   | (encode_fp8(vals[tid + 64u]) << 16u)
+                   | (encode_fp8(vals[tid + 96u]) << 24u);
+        if (is_v == 0u) {
+            if (!hi) { KCache0[c_off + tid] = packed; }
+            else     { KCache1[c_off + tid] = packed; }
+        } else {
+            if (!hi) { VCache0[c_off + tid] = packed; }
+            else     { VCache1[c_off + tid] = packed; }
+        }
     }
 }
 """
 
 # 12. Batched Split-K Attention with split K0/K1/V0/V1 + SWA 1024 ring buffer + Full 4096!
-B_ATTN_SK = """
+B_ATTN_SK = FAST_COMMON + """
 @group(0) @binding(0) var<storage, read> QRSG: array<f32>;
 @group(0) @binding(1) var<storage, read> RelBias: array<f32>;
-@group(0) @binding(2) var<storage, read> KCache0: array<f32>;
-@group(0) @binding(3) var<storage, read> KCache1: array<f32>;
-@group(0) @binding(4) var<storage, read> VCache0: array<f32>;
-@group(0) @binding(5) var<storage, read> VCache1: array<f32>;
+@group(0) @binding(2) var<storage, read> KCache0: array<u32>;
+@group(0) @binding(3) var<storage, read> KCache1: array<u32>;
+@group(0) @binding(4) var<storage, read> VCache0: array<u32>;
+@group(0) @binding(5) var<storage, read> VCache1: array<u32>;
 @group(0) @binding(6) var<storage, read_write> PartML: array<f32>;
 @group(0) @binding(7) var<storage, read_write> PartAcc: array<f32>;
 @group(0) @binding(8) var<storage, read> Meta: array<u32>;
-@group(0) @binding(9) var<uniform> params: vec4<u32>; // x=cache_idx, y=is_swa(1=SWA1024,0=Full4096)
+@group(0) @binding(9) var<uniform> params: vec4<u32>; // x=cache_idx, y=is_swa(1=SWA1024,0=Full)
 
-var<workgroup> r_sh: array<f32, 16>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let h = wg.x; let split = wg.y; let bi = wg.z; let kv_h = h / 3u; let tid = lid.x;
@@ -544,34 +695,44 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let qrsg_b = bi * 8600u;
     let q_base = qrsg_b + h * 128u;
     let q0 = QRSG[q_base + tid]; let q1 = QRSG[q_base + tid + 64u];
-    if (tid < 16u) { r_sh[tid] = QRSG[qrsg_b + 3072u + h * 16u + tid]; }
-    workgroupBarrier();
+    var r_val: f32 = 0.0;
+    if (tid < 16u) { r_val = QRSG[qrsg_b + 3072u + h * 16u + tid]; }
+    let rb_base = (tid & 15u) * 1024u;
 
     let sink = QRSG[qrsg_b + 3456u + h];
-    let inv_sqrt_d: f32 = 0.08838834764831845;
-    let half_slot = seq_slot & 7u;
+    let inv_sqrt_d: f32 = 0.005524271728019903; // 0.08838834764831845 / 16.0 (K FP8 scale)
+    let seq_cap = Meta[14];
+    let half_b = Meta[15];
+    let hi = (seq_slot >= half_b);
+    let half_slot = select(seq_slot, seq_slot - half_b, hi);
     let n_layers = select(8u, 40u, is_swa == 1u);
-    let cap = select(4096u, 1024u, is_swa == 1u);
-    let slot_base = (half_slot * n_layers + cache_idx) * cap * 1024u + kv_h * 128u;
-    let hi = (seq_slot >= 8u);
+    let cap = select(seq_cap, 1024u, is_swa == 1u);
+    let slot_base = (half_slot * n_layers + cache_idx) * cap * 256u + kv_h * 32u;
+    let lane32 = tid & 31u;
+    let sh0 = (tid >> 5u) * 8u;
+    let sh1 = sh0 + 16u;
     var m_run: f32 = -1e30; var l_run: f32 = 0.0; var acc0: f32 = 0.0; var acc1: f32 = 0.0;
 
     for (var k = s_begin; k < s_end; k++) {
         let k_phys = select(k, k & 1023u, is_swa == 1u);
-        let kv_off = slot_base + k_phys * 1024u;
-        var k0: f32; var k1: f32; var v0: f32; var v1: f32;
+        let kv_off = slot_base + k_phys * 256u;
+        var kp_u: u32; var vp_u: u32;
         if (!hi) {
-            k0 = KCache0[kv_off + tid]; k1 = KCache0[kv_off + tid + 64u];
-            v0 = VCache0[kv_off + tid]; v1 = VCache0[kv_off + tid + 64u];
+            kp_u = KCache0[kv_off + lane32];
+            vp_u = VCache0[kv_off + lane32];
         } else {
-            k0 = KCache1[kv_off + tid]; k1 = KCache1[kv_off + tid + 64u];
-            v0 = VCache1[kv_off + tid]; v1 = VCache1[kv_off + tid + 64u];
+            kp_u = KCache1[kv_off + lane32];
+            vp_u = VCache1[kv_off + lane32];
         }
+        let k0 = decode_fp8((kp_u >> sh0) & 0xFFu);
+        let k1 = decode_fp8((kp_u >> sh1) & 0xFFu);
+        let v0 = decode_fp8((vp_u >> sh0) & 0xFFu);
+        let v1 = decode_fp8((vp_u >> sh1) & 0xFFu);
         let qk = subgroupAdd(q0 * k0 + q1 * k1);
         var sc = qk * inv_sqrt_d - sink;
         let dist = pos - k;
         if (dist < 1024u) {
-            let rb_part = select(0.0, r_sh[tid] * RelBias[tid * 1024u + dist], tid < 16u);
+            let rb_part = select(0.0, r_val * RelBias[rb_base + dist], tid < 16u);
             sc += subgroupAdd(rb_part);
         }
         let m_new = max(m_run, sc);
@@ -583,7 +744,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         m_run = m_new;
     }
     if (tid == 0u) { PartML[ml_idx] = m_run; PartML[ml_idx + 1u] = l_run; }
-    PartAcc[acc_base + tid] = acc0; PartAcc[acc_base + tid + 64u] = acc1;
+    PartAcc[acc_base + tid] = acc0 * 0.03125; PartAcc[acc_base + tid + 64u] = acc1 * 0.03125;
 }
 """
 
@@ -622,17 +783,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }
 """
 
-# 14. SHARED-WEIGHT WO + conv + resid (8-way register tiled over batch!):
-# Dispatch: (1152, (B+7)/8, 1)
+# 14. SHARED-WEIGHT FP8 WO + conv + resid (8-way register tiled over batch!):
 B_WO_CONV = FAST_COMMON + """
 @group(0) @binding(0) var<storage, read> W: array<vec4<u32>>;
-@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;     // [B, 768]
+@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> ConvW: array<f32>;
-@group(0) @binding(3) var<storage, read> Resid: array<f32>;       // [B, 2304]
-@group(0) @binding(4) var<storage, read_write> Hist: array<f32>;  // [16, 48, 3, 2304]
-@group(0) @binding(5) var<storage, read_write> Out: array<f32>;   // [B, 2304]
+@group(0) @binding(3) var<storage, read> Resid: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Hist: array<f32>;
+@group(0) @binding(5) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(6) var<storage, read> Meta: array<u32>;
-@group(0) @binding(7) var<uniform> params: vec4<u32>;             // x=l_slot, y=add_resid
+@group(0) @binding(7) var<uniform> params: vec4<u32>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -641,32 +801,35 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let B = Meta[0];
     let b0 = wg.y * 8u; if (b0 >= B) { return; }
     let cnt = min(8u, B - b0);
-    let base = row * 384u;
+    let base = row * 192u;
 
     var a0: f32 = 0.0; var a1: f32 = 0.0; var a2: f32 = 0.0; var a3: f32 = 0.0;
     var a4: f32 = 0.0; var a5: f32 = 0.0; var a6: f32 = 0.0; var a7: f32 = 0.0;
-    for (var k = lane; k < 384u; k += 64u) {
-        let w = W[base + k]; let xk = k * 2u;
-        { let o = b0*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a0 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 1u) { let o = (b0+1u)*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a1 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 2u) { let o = (b0+2u)*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a2 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 3u) { let o = (b0+3u)*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a3 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 4u) { let o = (b0+4u)*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a4 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 5u) { let o = (b0+5u)*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a5 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 6u) { let o = (b0+6u)*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a6 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-        if (cnt > 7u) { let o = (b0+7u)*768u+xk; let x0 = X[o]; let x1 = X[o+1u]; a7 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+    for (var k = lane; k < 192u; k += 64u) {
+        let w = W[base + k]; let xk = k * 4u;
+        { let o = b0*768u+xk; a0 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        if (cnt > 1u) { let o = (b0+1u)*768u+xk; a1 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        if (cnt > 2u) { let o = (b0+2u)*768u+xk; a2 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        if (cnt > 3u) { let o = (b0+3u)*768u+xk; a3 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        if (cnt > 4u) { let o = (b0+4u)*768u+xk; a4 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        if (cnt > 5u) { let o = (b0+5u)*768u+xk; a5 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        if (cnt > 6u) { let o = (b0+6u)*768u+xk; a6 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+        if (cnt > 7u) { let o = (b0+7u)*768u+xk; a7 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
     }
+    let sv4 = W[2304u * 192u + (row >> 2u)];
+    let c_idx = row & 3u;
+    let sc = bitcast<f32>(select(select(sv4.x, sv4.y, c_idx == 1u), select(sv4.z, sv4.w, c_idx == 3u), c_idx >= 2u));
     var sums = array<f32, 8>(
-        subgroupAdd(a0), subgroupAdd(a1), subgroupAdd(a2), subgroupAdd(a3),
-        subgroupAdd(a4), subgroupAdd(a5), subgroupAdd(a6), subgroupAdd(a7)
+        subgroupAdd(a0) * sc, subgroupAdd(a1) * sc, subgroupAdd(a2) * sc, subgroupAdd(a3) * sc,
+        subgroupAdd(a4) * sc, subgroupAdd(a5) * sc, subgroupAdd(a6) * sc, subgroupAdd(a7) * sc
     );
     if (lane == 0u) {
         let cw0 = ConvW[row*4u]; let cw1 = ConvW[row*4u+1u]; let cw2 = ConvW[row*4u+2u]; let cw3 = ConvW[row*4u+3u];
         for (var j: u32 = 0u; j < cnt; j++) {
             let bi = b0 + j;
             let seq_slot = Meta[16u + bi];
-            let x3 = sums[j];
             let hb = (seq_slot * 48u + params.x) * 6912u;
+            let x3 = sums[j];
             let x0 = Hist[hb + row]; let x1 = Hist[hb + 2304u + row]; let x2 = Hist[hb + 4608u + row];
             Hist[hb + row] = x1; Hist[hb + 2304u + row] = x2; Hist[hb + 4608u + row] = x3;
             let y = (x3 + x0*cw0 + x1*cw1 + x2*cw2 + x3*cw3) * 0.4472135954999579;
@@ -875,6 +1038,7 @@ B_UNEMBED_P1 = FAST_COMMON + """
 @group(0) @binding(3) var<storage, read_write> PartI: array<u32>;
 @group(0) @binding(4) var<storage, read_write> Logits: array<f32>; // [16, 200058] DEVICE_LOCAL
 @group(0) @binding(5) var<storage, read> Meta: array<u32>;
+@group(0) @binding(6) var<storage, read> RowScale: array<f32>;
 var<workgroup> sh_v: array<f32, 32>;
 var<workgroup> sh_i: array<u32, 32>;
 @compute @workgroup_size(256)
@@ -886,26 +1050,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     var a0: f32 = 0.0; var a1: f32 = 0.0; var a2: f32 = 0.0; var a3: f32 = 0.0;
     var a4: f32 = 0.0; var a5: f32 = 0.0; var a6: f32 = 0.0; var a7: f32 = 0.0;
     if (row < 200058u) {
-        let base = row * 288u;
-        for (var k = lane; k < 288u; k += 64u) {
-            let w = W[base + k]; let xk = k * 2u;
-            { let o = b0*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a0 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-            if (cnt > 1u) { let o = (b0+1u)*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a1 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-            if (cnt > 2u) { let o = (b0+2u)*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a2 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-            if (cnt > 3u) { let o = (b0+3u)*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a3 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-            if (cnt > 4u) { let o = (b0+4u)*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a4 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-            if (cnt > 5u) { let o = (b0+5u)*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a5 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-            if (cnt > 6u) { let o = (b0+6u)*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a6 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
-            if (cnt > 7u) { let o = (b0+7u)*576u+xk; let x0 = X[o]; let x1 = X[o+1u]; a7 += bf16x2_dot(w.x, x0.xy) + bf16x2_dot(w.y, x0.zw) + bf16x2_dot(w.z, x1.xy) + bf16x2_dot(w.w, x1.zw); }
+        let base = row * 144u;
+        for (var k = lane; k < 144u; k += 64u) {
+            let w = W[base + k]; let xk = k * 4u;
+            { let o = b0*576u+xk; a0 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 1u) { let o = (b0+1u)*576u+xk; a1 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 2u) { let o = (b0+2u)*576u+xk; a2 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 3u) { let o = (b0+3u)*576u+xk; a3 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 4u) { let o = (b0+4u)*576u+xk; a4 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 5u) { let o = (b0+5u)*576u+xk; a5 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 6u) { let o = (b0+6u)*576u+xk; a6 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
+            if (cnt > 7u) { let o = (b0+7u)*576u+xk; a7 += dot4_fp8(w.x, X[o]) + dot4_fp8(w.y, X[o+1u]) + dot4_fp8(w.z, X[o+2u]) + dot4_fp8(w.w, X[o+3u]); }
         }
     }
     var vs = array<f32, 8>(
         subgroupAdd(a0), subgroupAdd(a1), subgroupAdd(a2), subgroupAdd(a3),
         subgroupAdd(a4), subgroupAdd(a5), subgroupAdd(a6), subgroupAdd(a7)
     );
+    let rsc = select(0.0, RowScale[min(row, 200057u)], row < 200058u);
     if (lane == 0u) {
         for (var j: u32 = 0u; j < cnt; j++) {
-            let cap_v = select(-1e30, 30.0 * tanh(vs[j] / 30.0), row < 200058u);
+            let cap_v = select(-1e30, 30.0 * tanh((vs[j] * rsc) / 30.0), row < 200058u);
             sh_v[j * 4u + sub] = cap_v;
             sh_i[j * 4u + sub] = row;
             if (row < 200058u) { Logits[(b0 + j) * 200058u + row] = cap_v; }
