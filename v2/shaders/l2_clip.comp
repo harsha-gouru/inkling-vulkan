@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4)           buffer F32RW { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32In { uint  v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t x_addr;
+    uint64_t scale_addr; // 0 or BF16 [n_heads, dim]
+    uint dim;            // 128 or 16
+    float threshold;
+    float post_mul;      // 1.0 or tau
+} pc;
+
+float read_bf16(U32In buf, uint idx) {
+    uint p = buf.v[idx >> 1];
+    uint bits = ((idx & 1u) == 0u) ? ((p & 0xFFFFu) << 16) : (p & 0xFFFF0000u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = h * pc.dim;
+    F32RW xb = F32RW(pc.x_addr);
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.dim; i += 64u) {
+        float val = xb.v[base + i];
+        if (pc.scale_addr != 0ul) {
+            U32In sb = U32In(pc.scale_addr);
+            val *= read_bf16(sb, base + i);
+            xb.v[base + i] = val;
+        }
+        ss += val * val;
+    }
+    ss = subgroupAdd(ss);
+    float norm = sqrt(ss) + 1e-6;
+    float factor = min(1.0, pc.threshold / norm) * pc.post_mul;
+
+    for (uint i = tid; i < pc.dim; i += 64u) {
+        xb.v[base + i] *= factor;
+    }
+}

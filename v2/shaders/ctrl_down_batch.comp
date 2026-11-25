@@ -1,0 +1,57 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Grid: (rank=64, n_ctrl=1 or 3, B)
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t cur_addr[3];      // each [B, dim]
+    uint64_t msg_addr[3];      // each [B, dim]
+    uint64_t down_w_addr[3];   // [rank, 2*dim]
+    uint64_t gate_out_addr[3]; // each [B, rank]
+    uint dim;
+    uint rank;
+} pc;
+
+vec2 unpack_bf16x2(uint packed) {
+    return vec2(uintBitsToFloat((packed & 0xFFFFu) << 16), uintBitsToFloat(packed & 0xFFFF0000u));
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y;
+    uint t = gl_WorkGroupID.z;
+    if (r >= pc.rank) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_v8 = pc.dim >> 3;
+    uint64_t tok_bytes = uint64_t(t) * uint64_t(pc.dim) * 4ul;
+
+    Vec4In  cbuf = Vec4In(pc.cur_addr[c] + tok_bytes);
+    Vec4In  mbuf = Vec4In(pc.msg_addr[c] + tok_bytes);
+    UVec4In wbuf0 = UVec4In(pc.down_w_addr[c] + uint64_t(r) * uint64_t(2u * pc.dim) * 2ul);
+    UVec4In wbuf1 = UVec4In(pc.down_w_addr[c] + (uint64_t(r) * uint64_t(2u * pc.dim) + uint64_t(pc.dim)) * 2ul);
+
+    float ss_c = 0.0, ss_m = 0.0, dot_c = 0.0, dot_m = 0.0;
+    for (uint i = tid; i < n_v8; i += 64u) {
+        vec4 x0 = cbuf.v[2u * i]; vec4 x1 = cbuf.v[2u * i + 1u];
+        ss_c += dot(x0, x0) + dot(x1, x1);
+        uvec4 wc = wbuf0.v[i];
+        dot_c += dot(vec4(unpack_bf16x2(wc.x), unpack_bf16x2(wc.y)), x0)
+               + dot(vec4(unpack_bf16x2(wc.z), unpack_bf16x2(wc.w)), x1);
+
+        vec4 m0 = mbuf.v[2u * i]; vec4 m1 = mbuf.v[2u * i + 1u];
+        ss_m += dot(m0, m0) + dot(m1, m1);
+        uvec4 wm = wbuf1.v[i];
+        dot_m += dot(vec4(unpack_bf16x2(wm.x), unpack_bf16x2(wm.y)), m0)
+               + dot(vec4(unpack_bf16x2(wm.z), unpack_bf16x2(wm.w)), m1);
+    }
+    float inv_c = inversesqrt(subgroupAdd(ss_c) / float(pc.dim) + 1e-6);
+    float inv_m = inversesqrt(subgroupAdd(ss_m) / float(pc.dim) + 1e-6);
+    float acc = subgroupAdd(dot_c) * inv_c + subgroupAdd(dot_m) * inv_m;
+    if (tid == 0u) F32Out(pc.gate_out_addr[c]).v[t * pc.rank + r] = acc;
+}

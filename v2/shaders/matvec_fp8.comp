@@ -1,0 +1,61 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// B=1 FP8 E4M3 per-row scaled matvec (cols multiple of 16, uvec4 = 16 FP8/iter)
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In   { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t s_addr;
+    uint64_t x_addr;
+    uint64_t y_addr;
+    uint rows;
+    uint cols;
+} pc;
+
+shared float s_lut[256];
+
+float decode_e4m3(uint code) {
+    uint sign = (code & 0x80u) << 24;
+    uint exp  = (code & 0x7Fu) >> 3;
+    uint man  = code & 7u;
+    if (exp != 0u) return uintBitsToFloat(sign | ((exp + 120u) << 23) | (man << 20));
+    float v = float(man) * (1.0 / 512.0);
+    return ((code & 0x80u) != 0u) ? -v : v;
+}
+
+vec4 unpack4(uint p) {
+    return vec4(s_lut[p & 255u], s_lut[(p >> 8) & 255u], s_lut[(p >> 16) & 255u], s_lut[(p >> 24) & 255u]);
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.y * 64u + gl_LocalInvocationID.x;
+    s_lut[lid] = decode_e4m3(lid);
+    barrier();
+
+    uint r = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    if (r >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_v16 = pc.cols >> 4;
+
+    UVec4In wbuf = UVec4In(pc.w_addr + uint64_t(r) * uint64_t(pc.cols));
+    Vec4In  xbuf = Vec4In(pc.x_addr);
+
+    float acc = 0.0;
+    for (uint i = tid; i < n_v16; i += 64u) {
+        uvec4 w = wbuf.v[i];
+        uint xb = i << 2;
+        acc += dot(unpack4(w.x), xbuf.v[xb + 0u]) + dot(unpack4(w.y), xbuf.v[xb + 1u])
+             + dot(unpack4(w.z), xbuf.v[xb + 2u]) + dot(unpack4(w.w), xbuf.v[xb + 3u]);
+    }
+    acc = subgroupAdd(acc);
+    if (tid == 0u) {
+        F32Out(pc.y_addr).v[r] = acc * F32In(pc.s_addr).v[r];
+    }
+}

@@ -1,0 +1,118 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In   { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer U32In   { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t q_addr;
+    uint64_t r_addr;
+    uint64_t rel_proj_t_addr; // BF16 transposed [1024, 16]
+    uint64_t k_cache_addr;    // F32 [max_ctx, 8, 128]
+    uint64_t v_cache_addr;    // F32 [max_ctx, 8, 128]
+    uint64_t part_ml_addr;
+    uint64_t part_o_addr;
+    uint64_t sink_addr;
+    uint64_t gate_addr;
+    uint64_t out_addr;
+    uint pos;
+    uint start_j;
+    uint n_splits;
+    uint kv_ring_mask;        // 0 for linear, or (1024-1) for SWA ring buffer
+} pc;
+
+float read_bf16(U32In buf, uint idx) {
+    uint p = buf.v[idx >> 1];
+    uint bits = ((idx & 1u) == 0u) ? ((p & 0xFFFFu) << 16) : (p & 0xFFFF0000u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint sp  = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint kvh = h / 3u;
+
+    uint n_kv = pc.pos - pc.start_j + 1u;
+    uint chunk = (n_kv + pc.n_splits - 1u) / pc.n_splits;
+    uint j_begin = pc.start_j + sp * chunk;
+    uint j_end   = min(pc.pos + 1u, j_begin + chunk);
+
+    uint slot = h * pc.n_splits + sp;
+    F32Out ml_out = F32Out(pc.part_ml_addr);
+    F32Out o_out  = F32Out(pc.part_o_addr);
+
+    if (pc.n_splits > 1u && j_begin >= j_end) {
+        if (tid == 0u) {
+            ml_out.v[slot * 2u + 0u] = -1e30;
+            ml_out.v[slot * 2u + 1u] = 0.0;
+        }
+        return;
+    }
+
+    F32In qb = F32In(pc.q_addr);
+    F32In rb = F32In(pc.r_addr);
+    U32In rp = U32In(pc.rel_proj_t_addr);
+    F32In kc = F32In(pc.k_cache_addr);
+    F32In vc = F32In(pc.v_cache_addr);
+
+    uint d0 = tid;
+    uint d1 = tid + 64u;
+    float q0 = qb.v[h * 128u + d0];
+    float q1 = qb.v[h * 128u + d1];
+    float r_local = (tid < 16u) ? rb.v[h * 16u + tid] : 0.0;
+
+    float m = -1e30;
+    float l = 0.0;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    const float inv_sqrt_128 = inversesqrt(128.0);
+
+    for (uint j = j_begin; j < j_end; ++j) {
+        uint phys_j = (pc.kv_ring_mask != 0u) ? (j & pc.kv_ring_mask) : j;
+        uint kv_base = phys_j * 1024u + kvh * 128u;
+        float dot = subgroupAdd(q0 * kc.v[kv_base + d0] + q1 * kc.v[kv_base + d1]);
+
+        uint dist = pc.pos - j;
+        float rel_b = 0.0;
+        if (dist < 1024u) {
+            float contrib = (tid < 16u) ? (r_local * read_bf16(rp, dist * 16u + tid)) : 0.0;
+            rel_b = subgroupAdd(contrib);
+        }
+
+        float s = dot * inv_sqrt_128 + rel_b;
+        float m_new = max(m, s);
+        float alpha = (l > 0.0) ? exp(m - m_new) : 0.0;
+        float p     = exp(s - m_new);
+        l = l * alpha + p;
+        acc0 = acc0 * alpha + p * vc.v[kv_base + d0];
+        acc1 = acc1 * alpha + p * vc.v[kv_base + d1];
+        m = m_new;
+    }
+
+    if (pc.n_splits == 1u) {
+        float sink_h = F32In(pc.sink_addr).v[h];
+        float m_glob = max(sink_h, m);
+        float w = (l > 0.0) ? exp(m - m_glob) : 0.0;
+        float l_glob = exp(sink_h - m_glob) + l * w;
+        float inv_l = 1.0 / l_glob;
+        F32In  gb = F32In(pc.gate_addr);
+        F32Out ob = F32Out(pc.out_addr);
+        uint idx0 = h * 128u + d0;
+        uint idx1 = h * 128u + d1;
+        ob.v[idx0] = ((acc0 * w) * inv_l) / (1.0 + exp(-gb.v[idx0]));
+        ob.v[idx1] = ((acc1 * w) * inv_l) / (1.0 + exp(-gb.v[idx1]));
+    } else {
+        if (tid == 0u) {
+            ml_out.v[slot * 2u + 0u] = m;
+            ml_out.v[slot * 2u + 1u] = l;
+        }
+        o_out.v[slot * 128u + d0] = acc0;
+        o_out.v[slot * 128u + d1] = acc1;
+    }
+}

@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32Buf { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Buf { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t embed_addr;
+    uint64_t norm_addr;
+    uint64_t out_addr;
+    uint token_id;
+    uint dim; // 2304 (even)
+} pc;
+
+vec2 unpack_bf16x2(uint packed) {
+    return vec2(uintBitsToFloat((packed & 0xFFFFu) << 16), uintBitsToFloat(packed & 0xFFFF0000u));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint half_dim = pc.dim >> 1;
+    uint64_t row_off = uint64_t(pc.token_id) * uint64_t(pc.dim) * 2ul;
+    U32Buf emb = U32Buf(pc.embed_addr + row_off);
+    U32Buf nw  = U32Buf(pc.norm_addr);
+    F32Buf dst = F32Buf(pc.out_addr);
+
+    float ss = 0.0;
+    for (uint i = tid; i < half_dim; i += 64u) {
+        vec2 x = unpack_bf16x2(emb.v[i]);
+        ss += x.x * x.x + x.y * x.y;
+    }
+    ss = subgroupAdd(ss);
+    float inv = inversesqrt(ss / float(pc.dim) + 1e-6);
+
+    for (uint i = tid; i < half_dim; i += 64u) {
+        vec2 x = unpack_bf16x2(emb.v[i]);
+        vec2 w = unpack_bf16x2(nw.v[i]);
+        dst.v[2u * i]      = x.x * inv * w.x;
+        dst.v[2u * i + 1u] = x.y * inv * w.y;
+    }
+}

@@ -1,0 +1,64 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Fused 6-or-8 attention projections in 1 dispatch for B=1 decode (cols = 2304, push constants = 116 B <= 128 B):
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t s_base;
+    uint64_t w0, w1, w2, w3, w4, w5, w6, w7;
+    uint nq_off, nk_off, nv_off;
+    uint y0_off, y1_off, y2_off, y3_off, y4_off, y5_off, y6_off, y7_off;
+} pc;
+
+vec2 unpack_bf16x2(uint packed) {
+    return vec2(uintBitsToFloat((packed & 0xFFFFu) << 16), uintBitsToFloat(packed & 0xFFFF0000u));
+}
+
+void main() {
+    uint rg = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint64_t wa;
+    uint x_off, y_off, r;
+    if (rg < 3072u) {
+        wa = pc.w0; x_off = pc.nq_off; y_off = pc.y0_off; r = rg;
+    } else if (rg < 4096u) {
+        wa = pc.w1; x_off = pc.nk_off; y_off = pc.y1_off; r = rg - 3072u;
+    } else if (rg < 5120u) {
+        wa = pc.w2; x_off = pc.nv_off; y_off = pc.y2_off; r = rg - 4096u;
+    } else if (rg < 5504u) {
+        wa = pc.w3; x_off = pc.nq_off; y_off = pc.y3_off; r = rg - 5120u;
+    } else if (rg < 5528u) {
+        wa = pc.w4; x_off = pc.nq_off; y_off = pc.y4_off; r = rg - 5504u;
+    } else if (rg < 8600u) {
+        wa = pc.w5; x_off = pc.nq_off; y_off = pc.y5_off; r = rg - 5528u;
+    } else if (rg < 8632u) {
+        wa = pc.w6; x_off = pc.nk_off; y_off = pc.y6_off; r = rg - 8600u;
+    } else if (rg < 8664u) {
+        wa = pc.w7; x_off = pc.nv_off; y_off = pc.y7_off; r = rg - 8632u;
+    } else {
+        return;
+    }
+
+    const uint n_v8 = 288u; // 2304 / 8
+    UVec4In wbuf = UVec4In(wa + uint64_t(r) * 4608ul); // 2304 * 2 bytes
+    Vec4In  xbuf = Vec4In(pc.s_base + uint64_t(x_off));
+
+    float acc = 0.0;
+    for (uint i = tid; i < n_v8; i += 64u) {
+        uvec4 w = wbuf.v[i];
+        vec4 x0 = xbuf.v[2u * i];
+        vec4 x1 = xbuf.v[2u * i + 1u];
+        vec2 u0 = unpack_bf16x2(w.x), u1 = unpack_bf16x2(w.y);
+        vec2 u2 = unpack_bf16x2(w.z), u3 = unpack_bf16x2(w.w);
+        acc += dot(vec4(u0, u1), x0) + dot(vec4(u2, u3), x1);
+    }
+    acc = subgroupAdd(acc);
+    if (tid == 0u) F32Out(pc.s_base + uint64_t(y_off)).v[r] = acc;
+}

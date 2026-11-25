@@ -1,0 +1,56 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly  buffer UVec2In { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Vec4Out { vec4  v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t in_addr;
+    uint64_t w_addr; // 0 for gamma-free
+    uint64_t out_addr;
+    uint dim;        // multiple of 4 (2304 or 128)
+} pc;
+
+shared float s_ss[4];
+
+vec4 unpack_bf16x4(uvec2 p) {
+    return vec4(
+        uintBitsToFloat((p.x & 0xFFFFu) << 16), uintBitsToFloat(p.x & 0xFFFF0000u),
+        uintBitsToFloat((p.y & 0xFFFFu) << 16), uintBitsToFloat(p.y & 0xFFFF0000u)
+    );
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_v4 = pc.dim >> 2;
+    uint base_v4 = row * n_v4;
+
+    Vec4In  src = Vec4In(pc.in_addr);
+    Vec4Out dst = Vec4Out(pc.out_addr);
+
+    vec4 x0 = (tid < n_v4) ? src.v[base_v4 + tid] : vec4(0.0);
+    vec4 x1 = (tid + 256u < n_v4) ? src.v[base_v4 + tid + 256u] : vec4(0.0);
+    vec4 x2 = (tid + 512u < n_v4) ? src.v[base_v4 + tid + 512u] : vec4(0.0);
+
+    float ss = subgroupAdd(dot(x0, x0) + dot(x1, x1) + dot(x2, x2));
+    if (gl_SubgroupInvocationID == 0u) s_ss[gl_SubgroupID] = ss;
+    barrier();
+    float total_ss = s_ss[0] + s_ss[1] + s_ss[2] + s_ss[3];
+    float inv = inversesqrt(total_ss / float(pc.dim) + 1e-6);
+
+    if (pc.w_addr != 0ul) {
+        UVec2In nw = UVec2In(pc.w_addr);
+        if (tid < n_v4)        dst.v[base_v4 + tid]        = x0 * inv * unpack_bf16x4(nw.v[tid]);
+        if (tid + 256u < n_v4) dst.v[base_v4 + tid + 256u] = x1 * inv * unpack_bf16x4(nw.v[tid + 256u]);
+        if (tid + 512u < n_v4) dst.v[base_v4 + tid + 512u] = x2 * inv * unpack_bf16x4(nw.v[tid + 512u]);
+    } else {
+        if (tid < n_v4)        dst.v[base_v4 + tid]        = x0 * inv;
+        if (tid + 256u < n_v4) dst.v[base_v4 + tid + 256u] = x1 * inv;
+        if (tid + 512u < n_v4) dst.v[base_v4 + tid + 512u] = x2 * inv;
+    }
+}

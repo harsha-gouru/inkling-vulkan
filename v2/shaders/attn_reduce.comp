@@ -1,0 +1,58 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+// Grid: (N_HEADS=24, 1, 1) — combines n_splits partials with sink_h and fuses sigmoid(gate_a)!
+layout(push_constant) uniform PC {
+    uint64_t part_ml_addr;
+    uint64_t part_o_addr;
+    uint64_t sink_addr;
+    uint64_t gate_addr;
+    uint64_t out_addr;
+    uint n_splits;
+} pc;
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint d0 = tid;
+    uint d1 = tid + 64u;
+
+    F32In  ml_in = F32In(pc.part_ml_addr);
+    F32In  o_in  = F32In(pc.part_o_addr);
+    F32In  sb    = F32In(pc.sink_addr);
+    F32In  gb    = F32In(pc.gate_addr);
+    F32Out ob    = F32Out(pc.out_addr);
+
+    float m_glob = sb.v[h];
+    for (uint sp = 0u; sp < pc.n_splits; ++sp) {
+        uint slot = h * pc.n_splits + sp;
+        float m_s = ml_in.v[slot * 2u + 0u];
+        m_glob = max(m_glob, m_s);
+    }
+
+    float l_glob = exp(sb.v[h] - m_glob);
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    for (uint sp = 0u; sp < pc.n_splits; ++sp) {
+        uint slot = h * pc.n_splits + sp;
+        float l_s = ml_in.v[slot * 2u + 1u];
+        if (l_s > 0.0) {
+            float m_s = ml_in.v[slot * 2u + 0u];
+            float w = exp(m_s - m_glob);
+            l_glob += l_s * w;
+            acc0 += o_in.v[slot * 128u + d0] * w;
+            acc1 += o_in.v[slot * 128u + d1] * w;
+        }
+    }
+
+    float inv_l = 1.0 / l_glob;
+    uint idx0 = h * 128u + d0;
+    uint idx1 = h * 128u + d1;
+    ob.v[idx0] = (acc0 * inv_l) / (1.0 + exp(-gb.v[idx0]));
+    ob.v[idx1] = (acc1 * inv_l) / (1.0 + exp(-gb.v[idx1]));
+}

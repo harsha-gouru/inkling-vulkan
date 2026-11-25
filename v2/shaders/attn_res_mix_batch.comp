@@ -1,0 +1,113 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Grid: (n_queries, B, 1) -> output layout: [n_queries, B, dim] (each query output is contiguous [B, dim]!)
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly  buffer UVec2In { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Vec4Out { vec4  v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t states_addr[8]; // each state is [B, dim]
+    uint64_t q_addr;         // [n_queries, dim]
+    uint64_t out_addr;       // [n_queries, B, dim]
+    uint64_t norm_w_addr[3];
+    uint m;
+    uint n_queries;
+    uint dim;
+    uint B;
+    uint do_norm;
+} pc;
+
+shared float s_ss[4];
+shared float s_dot[4];
+
+float wg_sum(float v) {
+    float sg = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) s_ss[gl_SubgroupID] = sg;
+    barrier();
+    float res = s_ss[0] + s_ss[1] + s_ss[2] + s_ss[3];
+    barrier();
+    return res;
+}
+void wg_sum2(float v0, float v1, out float r0, out float r1) {
+    float sg0 = subgroupAdd(v0), sg1 = subgroupAdd(v1);
+    if (gl_SubgroupInvocationID == 0u) { s_ss[gl_SubgroupID] = sg0; s_dot[gl_SubgroupID] = sg1; }
+    barrier();
+    r0 = s_ss[0] + s_ss[1] + s_ss[2] + s_ss[3];
+    r1 = s_dot[0] + s_dot[1] + s_dot[2] + s_dot[3];
+    barrier();
+}
+vec4 unpack_bf16x4(uvec2 p) {
+    return vec4(
+        uintBitsToFloat((p.x & 0xFFFFu) << 16), uintBitsToFloat(p.x & 0xFFFF0000u),
+        uintBitsToFloat((p.y & 0xFFFFu) << 16), uintBitsToFloat(p.y & 0xFFFF0000u)
+    );
+}
+
+void main() {
+    uint qi  = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_v4 = pc.dim >> 2;
+    uint64_t tok_bytes = uint64_t(tok) * uint64_t(pc.dim) * 4ul;
+
+    Vec4In  qbuf = Vec4In(pc.q_addr + uint64_t(qi) * uint64_t(pc.dim) * 4ul);
+    Vec4Out obuf = Vec4Out(pc.out_addr + (uint64_t(qi) * uint64_t(pc.B) + uint64_t(tok)) * uint64_t(pc.dim) * 4ul);
+
+    vec4 q0 = qbuf.v[tid];
+    vec4 q1 = qbuf.v[tid + 256u];
+    vec4 q2 = (tid + 512u < n_v4) ? qbuf.v[tid + 512u] : vec4(0.0);
+
+    float inv_sqrt_d = inversesqrt(float(pc.dim));
+    float inv_rms0 = 0.0, inv_rms1 = 0.0, inv_rms2 = 0.0, inv_rms3 = 0.0, inv_rms4 = 0.0;
+    float sc0 = -1e30, sc1 = -1e30, sc2 = -1e30, sc3 = -1e30, sc4 = -1e30;
+
+    #define SCORE_STATE(K, INV_R, SC) \
+    if (pc.m > uint(K)) { \
+        Vec4In sk = Vec4In(pc.states_addr[K] + tok_bytes); \
+        vec4 x0 = sk.v[tid]; vec4 x1 = sk.v[tid + 256u]; \
+        vec4 x2 = (tid + 512u < n_v4) ? sk.v[tid + 512u] : vec4(0.0); \
+        float ss, dt; \
+        wg_sum2(dot(x0,x0)+dot(x1,x1)+dot(x2,x2), dot(x0,q0)+dot(x1,q1)+dot(x2,q2), ss, dt); \
+        INV_R = inversesqrt(ss / float(pc.dim) + 1e-6); \
+        SC = (dt * INV_R) * inv_sqrt_d; \
+    }
+    SCORE_STATE(0, inv_rms0, sc0)
+    SCORE_STATE(1, inv_rms1, sc1)
+    SCORE_STATE(2, inv_rms2, sc2)
+    SCORE_STATE(3, inv_rms3, sc3)
+    SCORE_STATE(4, inv_rms4, sc4)
+
+    float mx = max(sc0, max(sc1, max(sc2, max(sc3, sc4))));
+    float e0 = (pc.m > 0u) ? exp(sc0 - mx) : 0.0;
+    float e1 = (pc.m > 1u) ? exp(sc1 - mx) : 0.0;
+    float e2 = (pc.m > 2u) ? exp(sc2 - mx) : 0.0;
+    float e3 = (pc.m > 3u) ? exp(sc3 - mx) : 0.0;
+    float e4 = (pc.m > 4u) ? exp(sc4 - mx) : 0.0;
+    float inv_sum = 1.0 / (e0 + e1 + e2 + e3 + e4);
+    float w0 = e0*inv_sum*inv_rms0, w1 = e1*inv_sum*inv_rms1, w2 = e2*inv_sum*inv_rms2, w3 = e3*inv_sum*inv_rms3, w4 = e4*inv_sum*inv_rms4;
+
+    vec4 o0 = vec4(0.0), o1 = vec4(0.0), o2 = vec4(0.0);
+    #define ACC_STATE(K, W) \
+    if (pc.m > uint(K)) { \
+        Vec4In sk = Vec4In(pc.states_addr[K] + tok_bytes); \
+        o0 += W * sk.v[tid]; o1 += W * sk.v[tid + 256u]; \
+        if (tid + 512u < n_v4) o2 += W * sk.v[tid + 512u]; \
+    }
+    ACC_STATE(0, w0) ACC_STATE(1, w1) ACC_STATE(2, w2) ACC_STATE(3, w3) ACC_STATE(4, w4)
+
+    if (pc.do_norm != 0u) {
+        float oss = wg_sum(dot(o0, o0) + dot(o1, o1) + dot(o2, o2));
+        float inv_o = inversesqrt(oss / float(pc.dim) + 1e-6);
+        uint64_t nw_a = (qi == 0u) ? pc.norm_w_addr[0] : ((qi == 1u) ? pc.norm_w_addr[1] : pc.norm_w_addr[2]);
+        UVec2In nw = UVec2In(nw_a);
+        o0 = o0 * inv_o * unpack_bf16x4(nw.v[tid]);
+        o1 = o1 * inv_o * unpack_bf16x4(nw.v[tid + 256u]);
+        if (tid + 512u < n_v4) o2 = o2 * inv_o * unpack_bf16x4(nw.v[tid + 512u]);
+    }
+    obuf.v[tid] = o0; obuf.v[tid + 256u] = o1;
+    if (tid + 512u < n_v4) obuf.v[tid + 512u] = o2;
+}

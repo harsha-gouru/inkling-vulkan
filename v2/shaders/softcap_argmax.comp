@@ -1,0 +1,57 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32In  { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U32Out { uint  v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t logits_addr;
+    uint64_t part_val_addr; // 256 floats
+    uint64_t part_id_addr;  // 256 uints
+    uint64_t out_id_addr;   // 1 uint (used in stage 1)
+    uint n;
+    uint stage;             // 0: 256 WGs over logits; 1: 1 WG over 256 partials
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (pc.stage == 0u) {
+        uint wg = gl_WorkGroupID.x;
+        uint stride = gl_NumWorkGroups.x * 64u;
+        F32In lb = F32In(pc.logits_addr);
+        float best_v = -1e30;
+        uint  best_i = 0u;
+        for (uint i = wg * 64u + tid; i < pc.n; i += stride) {
+            float v = lb.v[i];
+            if (v > best_v) { best_v = v; best_i = i; }
+        }
+        float gmax = subgroupMax(best_v);
+        uint winner = (best_v == gmax) ? best_i : 0xFFFFFFFFu;
+        uint wid = subgroupMin(winner);
+        if (tid == 0u) {
+            F32Out(pc.part_val_addr).v[wg] = gmax;
+            U32Out(pc.part_id_addr).v[wg]  = wid;
+        }
+    } else {
+        F32In pv = F32In(pc.part_val_addr);
+        U32In pi = U32In(pc.part_id_addr);
+        float best_v = -1e30;
+        uint  best_i = 0xFFFFFFFFu;
+        for (uint i = tid; i < pc.n; i += 64u) {
+            float v = pv.v[i];
+            uint  id = pi.v[i];
+            if (v > best_v || (v == best_v && id < best_i)) { best_v = v; best_i = id; }
+        }
+        float gmax = subgroupMax(best_v);
+        uint winner = (best_v == gmax) ? best_i : 0xFFFFFFFFu;
+        uint final_id = subgroupMin(winner);
+        if (tid == 0u) {
+            U32Out(pc.out_id_addr).v[0] = final_id;
+        }
+    }
+}

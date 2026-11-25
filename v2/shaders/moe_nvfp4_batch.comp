@@ -1,0 +1,214 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8)  readonly  buffer UVec2In { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer U32In   { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In   { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr, s_addr, amax_addr, denom_addr;
+    uint64_t counts_addr, offsets_addr, pair_tok_addr, pair_k_addr;
+    uint64_t x_addr, out_addr;
+    uint rows, cols, mode;
+} pc;
+
+shared float s_e2m1[16];
+
+float decode_e4m3_fast(uint code) {
+    uint sign = (code & 0x80u) << 24;
+    uint exp  = (code & 0x7Fu) >> 3;
+    uint man  = code & 7u;
+    if (exp != 0u) return uintBitsToFloat(sign | ((exp + 120u) << 23) | (man << 20));
+    float v = float(man) * (1.0 / 512.0);
+    return ((code & 0x80u) != 0u) ? -v : v;
+}
+
+float b16_dot(vec4 w0, vec4 w1, vec4 w2, vec4 w3, Vec4In xbuf, uint xb) {
+    return dot(w0, xbuf.v[xb]) + dot(w1, xbuf.v[xb+1u]) + dot(w2, xbuf.v[xb+2u]) + dot(w3, xbuf.v[xb+3u]);
+}
+
+void write_situ(uint slot, uint pair_idx, uint half_rows, float ag, float au, uint tid) {
+    float g = subgroupAdd(ag);
+    float u = subgroupAdd(au);
+    if (tid == 0u) {
+        float act = (4.0 * tanh(g * 0.25)) / (1.0 + exp(-g));
+        float up  = 25.0 * tanh(u * 0.04);
+        F32Out(pc.out_addr).v[slot * half_rows + pair_idx] = act * up;
+    }
+}
+
+void main() {
+    uint e = U32In(pc.offsets_addr).v[128u + gl_WorkGroupID.y];
+    if (e == 0xFFFFFFFFu) return;
+    uint cnt = U32In(pc.counts_addr).v[e];
+
+    uint lid = gl_LocalInvocationID.y * 64u + gl_LocalInvocationID.x;
+    if (lid < 16u) {
+        const float tbl[16] = float[16](
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+           -0.0,-0.5,-1.0,-1.5,-2.0,-3.0,-4.0,-6.0
+        );
+        s_e2m1[lid] = tbl[lid];
+    }
+    barrier();
+
+    uint tid = gl_LocalInvocationID.x;
+    uint sub = gl_LocalInvocationID.y;
+    uint off = U32In(pc.offsets_addr).v[e];
+    float outer = F32In(pc.amax_addr).v[e] / F32In(pc.denom_addr).v[0];
+    uint scale_cols = pc.cols >> 4;
+    U32In pt = U32In(pc.pair_tok_addr);
+    U32In pk = U32In(pc.pair_k_addr);
+    Vec4In xbuf = Vec4In(pc.x_addr);
+    uint xs = pc.cols >> 2;
+
+    if (pc.mode == 0u) {
+        uint pair_idx = gl_WorkGroupID.x * 4u + sub;
+        uint half_rows = pc.rows >> 1;
+        if (pair_idx >= half_rows) return;
+        uint r0 = 2u * pair_idx;
+        uint64_t row_w_stride = uint64_t(pc.cols >> 1);
+        uint64_t row_s_stride = uint64_t(scale_cols);
+        uint64_t w0_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r0)) * row_w_stride;
+        uint64_t s0_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r0)) * row_s_stride;
+        uint64_t s1_bytes = s0_bytes + row_s_stride;
+        UVec2In wb0 = UVec2In(pc.w_addr + w0_bytes);
+        UVec2In wb1 = UVec2In(pc.w_addr + w0_bytes + row_w_stride);
+        U32In   sb0 = U32In(pc.s_addr + (s0_bytes & ~3ul));
+        U32In   sb1 = U32In(pc.s_addr + (s1_bytes & ~3ul));
+        uint so0 = uint(s0_bytes & 3ul), so1 = uint(s1_bytes & 3ul);
+
+        if (cnt == 1u) {
+            uint t0 = pt.v[off], sl0 = t0 * 8u + pk.v[off];
+            float ag0 = 0.0, au0 = 0.0;
+            for (uint b = tid; b < scale_cols; b += 64u) {
+                uint xb = t0 * xs + 4u * b;
+                vec4 x0 = xbuf.v[xb], x1 = xbuf.v[xb+1u], x2 = xbuf.v[xb+2u], x3 = xbuf.v[xb+3u];
+                uvec2 wg = wb0.v[b]; uint i0 = b + so0;
+                float bsg = decode_e4m3_fast((sb0.v[i0 >> 2] >> ((i0 & 3u) * 8u)) & 0xFFu) * outer;
+                vec4 g0 = vec4(s_e2m1[(wg.x>>0u)&15u], s_e2m1[(wg.x>>4u)&15u], s_e2m1[(wg.x>>8u)&15u], s_e2m1[(wg.x>>12u)&15u]);
+                vec4 g1 = vec4(s_e2m1[(wg.x>>16u)&15u], s_e2m1[(wg.x>>20u)&15u], s_e2m1[(wg.x>>24u)&15u], s_e2m1[(wg.x>>28u)&15u]);
+                vec4 g2 = vec4(s_e2m1[(wg.y>>0u)&15u], s_e2m1[(wg.y>>4u)&15u], s_e2m1[(wg.y>>8u)&15u], s_e2m1[(wg.y>>12u)&15u]);
+                vec4 g3 = vec4(s_e2m1[(wg.y>>16u)&15u], s_e2m1[(wg.y>>20u)&15u], s_e2m1[(wg.y>>24u)&15u], s_e2m1[(wg.y>>28u)&15u]);
+                ag0 += (dot(g0,x0)+dot(g1,x1)+dot(g2,x2)+dot(g3,x3)) * bsg;
+                uvec2 wu = wb1.v[b]; uint i1 = b + so1;
+                float bsu = decode_e4m3_fast((sb1.v[i1 >> 2] >> ((i1 & 3u) * 8u)) & 0xFFu) * outer;
+                vec4 u0 = vec4(s_e2m1[(wu.x>>0u)&15u], s_e2m1[(wu.x>>4u)&15u], s_e2m1[(wu.x>>8u)&15u], s_e2m1[(wu.x>>12u)&15u]);
+                vec4 u1 = vec4(s_e2m1[(wu.x>>16u)&15u], s_e2m1[(wu.x>>20u)&15u], s_e2m1[(wu.x>>24u)&15u], s_e2m1[(wu.x>>28u)&15u]);
+                vec4 u2 = vec4(s_e2m1[(wu.y>>0u)&15u], s_e2m1[(wu.y>>4u)&15u], s_e2m1[(wu.y>>8u)&15u], s_e2m1[(wu.y>>12u)&15u]);
+                vec4 u3 = vec4(s_e2m1[(wu.y>>16u)&15u], s_e2m1[(wu.y>>20u)&15u], s_e2m1[(wu.y>>24u)&15u], s_e2m1[(wu.y>>28u)&15u]);
+                au0 += (dot(u0,x0)+dot(u1,x1)+dot(u2,x2)+dot(u3,x3)) * bsu;
+            }
+            write_situ(sl0, pair_idx, half_rows, ag0, au0, tid);
+            return;
+        }
+
+        for (uint p0 = 0u; p0 < cnt; p0 += 8u) {
+            uint np = min(8u, cnt - p0);
+            uint t0=pt.v[off+p0], sl0=t0*8u+pk.v[off+p0];
+            uint t1=(np>1u)?pt.v[off+p0+1u]:0u, sl1=(np>1u)?(t1*8u+pk.v[off+p0+1u]):0u;
+            uint t2=(np>2u)?pt.v[off+p0+2u]:0u, sl2=(np>2u)?(t2*8u+pk.v[off+p0+2u]):0u;
+            uint t3=(np>3u)?pt.v[off+p0+3u]:0u, sl3=(np>3u)?(t3*8u+pk.v[off+p0+3u]):0u;
+            uint t4=(np>4u)?pt.v[off+p0+4u]:0u, sl4=(np>4u)?(t4*8u+pk.v[off+p0+4u]):0u;
+            uint t5=(np>5u)?pt.v[off+p0+5u]:0u, sl5=(np>5u)?(t5*8u+pk.v[off+p0+5u]):0u;
+            uint t6=(np>6u)?pt.v[off+p0+6u]:0u, sl6=(np>6u)?(t6*8u+pk.v[off+p0+6u]):0u;
+            uint t7=(np>7u)?pt.v[off+p0+7u]:0u, sl7=(np>7u)?(t7*8u+pk.v[off+p0+7u]):0u;
+            float ag0=0,ag1=0,ag2=0,ag3=0,ag4=0,ag5=0,ag6=0,ag7=0;
+            float au0=0,au1=0,au2=0,au3=0,au4=0,au5=0,au6=0,au7=0;
+            for (uint b = tid; b < scale_cols; b += 64u) {
+                uvec2 wg = wb0.v[b]; uint i0 = b + so0;
+                float bsg = decode_e4m3_fast((sb0.v[i0 >> 2] >> ((i0 & 3u) * 8u)) & 0xFFu) * outer;
+                vec4 g0 = vec4(s_e2m1[(wg.x>>0u)&15u], s_e2m1[(wg.x>>4u)&15u], s_e2m1[(wg.x>>8u)&15u], s_e2m1[(wg.x>>12u)&15u]);
+                vec4 g1 = vec4(s_e2m1[(wg.x>>16u)&15u], s_e2m1[(wg.x>>20u)&15u], s_e2m1[(wg.x>>24u)&15u], s_e2m1[(wg.x>>28u)&15u]);
+                vec4 g2 = vec4(s_e2m1[(wg.y>>0u)&15u], s_e2m1[(wg.y>>4u)&15u], s_e2m1[(wg.y>>8u)&15u], s_e2m1[(wg.y>>12u)&15u]);
+                vec4 g3 = vec4(s_e2m1[(wg.y>>16u)&15u], s_e2m1[(wg.y>>20u)&15u], s_e2m1[(wg.y>>24u)&15u], s_e2m1[(wg.y>>28u)&15u]);
+                uvec2 wu = wb1.v[b]; uint i1 = b + so1;
+                float bsu = decode_e4m3_fast((sb1.v[i1 >> 2] >> ((i1 & 3u) * 8u)) & 0xFFu) * outer;
+                vec4 u0 = vec4(s_e2m1[(wu.x>>0u)&15u], s_e2m1[(wu.x>>4u)&15u], s_e2m1[(wu.x>>8u)&15u], s_e2m1[(wu.x>>12u)&15u]);
+                vec4 u1 = vec4(s_e2m1[(wu.x>>16u)&15u], s_e2m1[(wu.x>>20u)&15u], s_e2m1[(wu.x>>24u)&15u], s_e2m1[(wu.x>>28u)&15u]);
+                vec4 u2 = vec4(s_e2m1[(wu.y>>0u)&15u], s_e2m1[(wu.y>>4u)&15u], s_e2m1[(wu.y>>8u)&15u], s_e2m1[(wu.y>>12u)&15u]);
+                vec4 u3 = vec4(s_e2m1[(wu.y>>16u)&15u], s_e2m1[(wu.y>>20u)&15u], s_e2m1[(wu.y>>24u)&15u], s_e2m1[(wu.y>>28u)&15u]);
+                uint b4 = 4u * b;
+                ag0 += b16_dot(g0,g1,g2,g3,xbuf,t0*xs+b4)*bsg; au0 += b16_dot(u0,u1,u2,u3,xbuf,t0*xs+b4)*bsu;
+                if (np>1u) { ag1 += b16_dot(g0,g1,g2,g3,xbuf,t1*xs+b4)*bsg; au1 += b16_dot(u0,u1,u2,u3,xbuf,t1*xs+b4)*bsu; }
+                if (np>2u) { ag2 += b16_dot(g0,g1,g2,g3,xbuf,t2*xs+b4)*bsg; au2 += b16_dot(u0,u1,u2,u3,xbuf,t2*xs+b4)*bsu; }
+                if (np>3u) { ag3 += b16_dot(g0,g1,g2,g3,xbuf,t3*xs+b4)*bsg; au3 += b16_dot(u0,u1,u2,u3,xbuf,t3*xs+b4)*bsu; }
+                if (np>4u) { ag4 += b16_dot(g0,g1,g2,g3,xbuf,t4*xs+b4)*bsg; au4 += b16_dot(u0,u1,u2,u3,xbuf,t4*xs+b4)*bsu; }
+                if (np>5u) { ag5 += b16_dot(g0,g1,g2,g3,xbuf,t5*xs+b4)*bsg; au5 += b16_dot(u0,u1,u2,u3,xbuf,t5*xs+b4)*bsu; }
+                if (np>6u) { ag6 += b16_dot(g0,g1,g2,g3,xbuf,t6*xs+b4)*bsg; au6 += b16_dot(u0,u1,u2,u3,xbuf,t6*xs+b4)*bsu; }
+                if (np>7u) { ag7 += b16_dot(g0,g1,g2,g3,xbuf,t7*xs+b4)*bsg; au7 += b16_dot(u0,u1,u2,u3,xbuf,t7*xs+b4)*bsu; }
+            }
+            write_situ(sl0,pair_idx,half_rows,ag0,au0,tid);
+            if (np>1u) write_situ(sl1,pair_idx,half_rows,ag1,au1,tid);
+            if (np>2u) write_situ(sl2,pair_idx,half_rows,ag2,au2,tid);
+            if (np>3u) write_situ(sl3,pair_idx,half_rows,ag3,au3,tid);
+            if (np>4u) write_situ(sl4,pair_idx,half_rows,ag4,au4,tid);
+            if (np>5u) write_situ(sl5,pair_idx,half_rows,ag5,au5,tid);
+            if (np>6u) write_situ(sl6,pair_idx,half_rows,ag6,au6,tid);
+            if (np>7u) write_situ(sl7,pair_idx,half_rows,ag7,au7,tid);
+        }
+    } else {
+        uint r = gl_WorkGroupID.x * 4u + sub;
+        if (r >= pc.rows) return;
+        uint64_t w_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r)) * uint64_t(pc.cols >> 1);
+        uint64_t s_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r)) * uint64_t(scale_cols);
+        UVec2In wb = UVec2In(pc.w_addr + w_bytes);
+        U32In   sb = U32In(pc.s_addr + (s_bytes & ~3ul));
+        uint so = uint(s_bytes & 3ul);
+
+        if (cnt == 1u) {
+            uint sl0 = pt.v[off] * 8u + pk.v[off];
+            float a0 = 0.0;
+            for (uint b = tid; b < scale_cols; b += 64u) {
+                uvec2 w = wb.v[b]; uint idx = b + so;
+                float bs = decode_e4m3_fast((sb.v[idx >> 2] >> ((idx & 3u) * 8u)) & 0xFFu) * outer;
+                vec4 w0 = vec4(s_e2m1[(w.x>>0u)&15u], s_e2m1[(w.x>>4u)&15u], s_e2m1[(w.x>>8u)&15u], s_e2m1[(w.x>>12u)&15u]);
+                vec4 w1 = vec4(s_e2m1[(w.x>>16u)&15u], s_e2m1[(w.x>>20u)&15u], s_e2m1[(w.x>>24u)&15u], s_e2m1[(w.x>>28u)&15u]);
+                vec4 w2 = vec4(s_e2m1[(w.y>>0u)&15u], s_e2m1[(w.y>>4u)&15u], s_e2m1[(w.y>>8u)&15u], s_e2m1[(w.y>>12u)&15u]);
+                vec4 w3 = vec4(s_e2m1[(w.y>>16u)&15u], s_e2m1[(w.y>>20u)&15u], s_e2m1[(w.y>>24u)&15u], s_e2m1[(w.y>>28u)&15u]);
+                a0 += b16_dot(w0,w1,w2,w3, xbuf, sl0*xs + 4u*b) * bs;
+            }
+            float y = subgroupAdd(a0);
+            if (tid == 0u) F32Out(pc.out_addr).v[sl0 * pc.rows + r] = y;
+            return;
+        }
+
+        for (uint p0 = 0u; p0 < cnt; p0 += 8u) {
+            uint np = min(8u, cnt - p0);
+            uint sl0=pt.v[off+p0]*8u+pk.v[off+p0];
+            uint sl1=(np>1u)?(pt.v[off+p0+1u]*8u+pk.v[off+p0+1u]):0u;
+            uint sl2=(np>2u)?(pt.v[off+p0+2u]*8u+pk.v[off+p0+2u]):0u;
+            uint sl3=(np>3u)?(pt.v[off+p0+3u]*8u+pk.v[off+p0+3u]):0u;
+            uint sl4=(np>4u)?(pt.v[off+p0+4u]*8u+pk.v[off+p0+4u]):0u;
+            uint sl5=(np>5u)?(pt.v[off+p0+5u]*8u+pk.v[off+p0+5u]):0u;
+            uint sl6=(np>6u)?(pt.v[off+p0+6u]*8u+pk.v[off+p0+6u]):0u;
+            uint sl7=(np>7u)?(pt.v[off+p0+7u]*8u+pk.v[off+p0+7u]):0u;
+            float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
+            for (uint b = tid; b < scale_cols; b += 64u) {
+                uvec2 w = wb.v[b]; uint idx = b + so;
+                float bs = decode_e4m3_fast((sb.v[idx >> 2] >> ((idx & 3u) * 8u)) & 0xFFu) * outer;
+                vec4 w0 = vec4(s_e2m1[(w.x>>0u)&15u], s_e2m1[(w.x>>4u)&15u], s_e2m1[(w.x>>8u)&15u], s_e2m1[(w.x>>12u)&15u]);
+                vec4 w1 = vec4(s_e2m1[(w.x>>16u)&15u], s_e2m1[(w.x>>20u)&15u], s_e2m1[(w.x>>24u)&15u], s_e2m1[(w.x>>28u)&15u]);
+                vec4 w2 = vec4(s_e2m1[(w.y>>0u)&15u], s_e2m1[(w.y>>4u)&15u], s_e2m1[(w.y>>8u)&15u], s_e2m1[(w.y>>12u)&15u]);
+                vec4 w3 = vec4(s_e2m1[(w.y>>16u)&15u], s_e2m1[(w.y>>20u)&15u], s_e2m1[(w.y>>24u)&15u], s_e2m1[(w.y>>28u)&15u]);
+                uint b4 = 4u * b;
+                a0 += b16_dot(w0,w1,w2,w3,xbuf,sl0*xs+b4)*bs;
+                if (np>1u) a1 += b16_dot(w0,w1,w2,w3,xbuf,sl1*xs+b4)*bs;
+                if (np>2u) a2 += b16_dot(w0,w1,w2,w3,xbuf,sl2*xs+b4)*bs;
+                if (np>3u) a3 += b16_dot(w0,w1,w2,w3,xbuf,sl3*xs+b4)*bs;
+                if (np>4u) a4 += b16_dot(w0,w1,w2,w3,xbuf,sl4*xs+b4)*bs;
+                if (np>5u) a5 += b16_dot(w0,w1,w2,w3,xbuf,sl5*xs+b4)*bs;
+                if (np>6u) a6 += b16_dot(w0,w1,w2,w3,xbuf,sl6*xs+b4)*bs;
+                if (np>7u) a7 += b16_dot(w0,w1,w2,w3,xbuf,sl7*xs+b4)*bs;
+            }
+            #define STW(SL, A) { float y = subgroupAdd(A); if (tid == 0u) F32Out(pc.out_addr).v[(SL)*pc.rows + r] = y; }
+            STW(sl0,a0) if(np>1u) STW(sl1,a1) if(np>2u) STW(sl2,a2) if(np>3u) STW(sl3,a3)
+            if(np>4u) STW(sl4,a4) if(np>5u) STW(sl5,a5) if(np>6u) STW(sl6,a6) if(np>7u) STW(sl7,a7)
+        }
+    }
+}

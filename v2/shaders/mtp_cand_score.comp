@@ -1,0 +1,57 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Stage 0: Grid (1024, 1, 1), 64 threads -> score[c] = base_val[c] + dot(unembed[id[c]], dh)
+// Stage 1: Grid (1, 1, 1), 64 threads -> argmax over 1024 scores (16 per lane) -> out_tok_addr
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer U32In   { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In   { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer U32Out  { uint  v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t unemb_addr;
+    uint64_t dh_addr;
+    uint64_t cand_ids_addr;
+    uint64_t cand_vals_addr;
+    uint64_t scores_addr;
+    uint64_t out_tok_addr;
+    uint stage;
+} pc;
+
+vec2 unpack_bf16x2(uint packed) {
+    return vec2(uintBitsToFloat((packed & 0xFFFFu) << 16), uintBitsToFloat(packed & 0xFFFF0000u));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (pc.stage == 0u) {
+        uint c = gl_WorkGroupID.x;
+        uint vid = U32In(pc.cand_ids_addr).v[c];
+        UVec4In wb = UVec4In(pc.unemb_addr + uint64_t(vid) * 2304ul * 2ul);
+        Vec4In  xb = Vec4In(pc.dh_addr);
+        float acc = 0.0;
+        for (uint i = tid; i < 288u; i += 64u) {
+            uvec4 w = wb.v[i];
+            acc += dot(vec4(unpack_bf16x2(w.x), unpack_bf16x2(w.y)), xb.v[2u*i])
+                 + dot(vec4(unpack_bf16x2(w.z), unpack_bf16x2(w.w)), xb.v[2u*i + 1u]);
+        }
+        float s = subgroupAdd(acc);
+        if (tid == 0u) F32Out(pc.scores_addr).v[c] = F32In(pc.cand_vals_addr).v[c] + s;
+    } else {
+        F32In sc = F32In(pc.scores_addr);
+        float bv = -1e30; uint bi = 0u;
+        for (uint k = 0u; k < 16u; ++k) {
+            uint idx = tid + k * 64u;
+            float v = sc.v[idx];
+            if (v > bv) { bv = v; bi = idx; }
+        }
+        float gmax = subgroupMax(bv);
+        uint win = subgroupMin((bv == gmax) ? bi : 0xFFFFFFFFu);
+        if (tid == 0u) U32Out(pc.out_tok_addr).v[0] = U32In(pc.cand_ids_addr).v[win];
+    }
+}

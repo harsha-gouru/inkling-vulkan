@@ -1,0 +1,312 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Scaled FP16->FP32 WMMA FlashAttention-2 for Inkling-2-Mini prefill (B > 8), Wave64-native:
+// Scaling Q,K,V by 1/16 prevents FP16 overflow while giving 10-bit mantissa precision (8x tighter than BF16).
+// WG: 64 x 4 = 256 threads = 4 wave64 subgroups, 64 queries/WG sharing K/V tiles!
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer U32In  { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t q_addr, r_addr, sink_addr, gate_addr, rel_proj_addr, k_cache_addr, v_cache_addr, out_addr;
+    uint pos_start, is_glob, ring_mask, B;
+} pc;
+
+shared float16_t s_k[16 * 128];
+shared float16_t s_v[16 * 128];
+shared float     s_r[4][16 * 16];
+shared float     s_s[4][16 * 16];
+shared float16_t s_p[4][16 * 16];
+shared float     s_alpha[4][16];
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x; // 0..63 (one full wave64 subgroup)
+    uint sub  = gl_LocalInvocationID.y; // 0..3
+    uint lid  = sub * 64u + lane;       // 0..255
+    uint kvh  = h / 3u;
+
+    uint wg_t0  = gl_WorkGroupID.y * 64u;
+    uint sub_t0 = wg_t0 + sub * 16u;
+
+    uint qr     = lane >> 2; // 0..15
+    uint qtr    = lane & 3u; // 0..3
+    uint k_base = qtr * 4u;
+
+    F32In  rb = F32In(pc.r_addr), sb = F32In(pc.sink_addr), gb = F32In(pc.gate_addr);
+    Vec4In kv4 = Vec4In(pc.k_cache_addr), vv4 = Vec4In(pc.v_cache_addr), qv4 = Vec4In(pc.q_addr);
+    U32In  rp = U32In(pc.rel_proj_addr);
+    F32Out ob = F32Out(pc.out_addr);
+
+    const float QKV_SC = 0.0625; // 1/16
+
+    {
+        uint gt = sub_t0 + qr;
+        if (gt < pc.B) {
+            uint base = gt * 384u + h * 16u + k_base;
+            s_r[sub][qr * 16u + k_base + 0u] = rb.v[base + 0u];
+            s_r[sub][qr * 16u + k_base + 1u] = rb.v[base + 1u];
+            s_r[sub][qr * 16u + k_base + 2u] = rb.v[base + 2u];
+            s_r[sub][qr * 16u + k_base + 3u] = rb.v[base + 3u];
+        } else {
+            s_r[sub][qr * 16u + k_base + 0u] = 0.0;
+            s_r[sub][qr * 16u + k_base + 1u] = 0.0;
+            s_r[sub][qr * 16u + k_base + 2u] = 0.0;
+            s_r[sub][qr * 16u + k_base + 3u] = 0.0;
+        }
+    }
+
+    uint kv_r  = lid >> 4;
+    uint kv_c4 = (lid & 15u) * 4u;
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> q0, q1, q2, q3, q4, q5, q6, q7;
+    {
+        uint gt0 = wg_t0 + kv_r;
+        uint gt1 = wg_t0 + 16u + kv_r;
+        for (uint p = 0u; p < 2u; ++p) {
+            uint col = p * 64u + kv_c4;
+            vec4 v0 = ((gt0 < pc.B) ? qv4.v[(gt0 * 3072u + h * 128u + col) >> 2] : vec4(0.0)) * QKV_SC;
+            vec4 v1 = ((gt1 < pc.B) ? qv4.v[(gt1 * 3072u + h * 128u + col) >> 2] : vec4(0.0)) * QKV_SC;
+            s_k[kv_r * 128u + col + 0u] = float16_t(v0.x); s_k[kv_r * 128u + col + 1u] = float16_t(v0.y);
+            s_k[kv_r * 128u + col + 2u] = float16_t(v0.z); s_k[kv_r * 128u + col + 3u] = float16_t(v0.w);
+            s_v[kv_r * 128u + col + 0u] = float16_t(v1.x); s_v[kv_r * 128u + col + 1u] = float16_t(v1.y);
+            s_v[kv_r * 128u + col + 2u] = float16_t(v1.z); s_v[kv_r * 128u + col + 3u] = float16_t(v1.w);
+        }
+        barrier();
+        if (sub == 0u) {
+            coopMatLoad(q0, s_k,   0u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q1, s_k,  16u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q2, s_k,  32u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q3, s_k,  48u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q4, s_k,  64u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q5, s_k,  80u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q6, s_k,  96u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q7, s_k, 112u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+        } else if (sub == 1u) {
+            coopMatLoad(q0, s_v,   0u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q1, s_v,  16u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q2, s_v,  32u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q3, s_v,  48u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q4, s_v,  64u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q5, s_v,  80u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q6, s_v,  96u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q7, s_v, 112u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+    }
+    {
+        uint gt2 = wg_t0 + 32u + kv_r;
+        uint gt3 = wg_t0 + 48u + kv_r;
+        for (uint p = 0u; p < 2u; ++p) {
+            uint col = p * 64u + kv_c4;
+            vec4 v2 = ((gt2 < pc.B) ? qv4.v[(gt2 * 3072u + h * 128u + col) >> 2] : vec4(0.0)) * QKV_SC;
+            vec4 v3 = ((gt3 < pc.B) ? qv4.v[(gt3 * 3072u + h * 128u + col) >> 2] : vec4(0.0)) * QKV_SC;
+            s_k[kv_r * 128u + col + 0u] = float16_t(v2.x); s_k[kv_r * 128u + col + 1u] = float16_t(v2.y);
+            s_k[kv_r * 128u + col + 2u] = float16_t(v2.z); s_k[kv_r * 128u + col + 3u] = float16_t(v2.w);
+            s_v[kv_r * 128u + col + 0u] = float16_t(v3.x); s_v[kv_r * 128u + col + 1u] = float16_t(v3.y);
+            s_v[kv_r * 128u + col + 2u] = float16_t(v3.z); s_v[kv_r * 128u + col + 3u] = float16_t(v3.w);
+        }
+        barrier();
+        if (sub == 2u) {
+            coopMatLoad(q0, s_k,   0u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q1, s_k,  16u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q2, s_k,  32u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q3, s_k,  48u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q4, s_k,  64u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q5, s_k,  80u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q6, s_k,  96u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q7, s_k, 112u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+        } else if (sub == 3u) {
+            coopMatLoad(q0, s_v,   0u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q1, s_v,  16u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q2, s_v,  32u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q3, s_v,  48u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q4, s_v,  64u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q5, s_v,  80u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q6, s_v,  96u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(q7, s_v, 112u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o1 = o0, o2 = o0, o3 = o0, o4 = o0, o5 = o0, o6 = o0, o7 = o0;
+
+    float m_prev = -1e30;
+    float l_prev = 0.0;
+    const float sc = inversesqrt(128.0) * 256.0; // undo QKV_SC * QKV_SC = 1/256
+
+    uint wg_pos0    = pc.pos_start + wg_t0;
+    uint wg_pos_end = pc.pos_start + min(pc.B, wg_t0 + 64u) - 1u;
+    uint start_j    = (pc.is_glob != 0u) ? 0u : ((wg_pos0 >= 1023u) ? (wg_pos0 - 1023u) : 0u);
+
+    uint pos_q      = pc.pos_start + sub_t0 + qr;
+    uint sub_pos0   = pc.pos_start + sub_t0;
+    uint sub_pos_hi = pc.pos_start + min(pc.B, sub_t0 + 16u) - 1u;
+    bool sub_valid  = (sub_t0 < pc.B);
+
+    for (uint j0 = start_j; j0 <= wg_pos_end; j0 += 16u) {
+        uint tile_n = min(16u, wg_pos_end - j0 + 1u);
+        if (kv_r < tile_n) {
+            uint j = j0 + kv_r;
+            uint phys = (pc.ring_mask != 0u) ? (j & pc.ring_mask) : j;
+            uint kv_base4 = (phys * 1024u + kvh * 128u) >> 2;
+            for (uint p = 0u; p < 2u; ++p) {
+                uint col = p * 64u + kv_c4;
+                vec4 vk = kv4.v[kv_base4 + (col >> 2)] * QKV_SC;
+                vec4 vv = vv4.v[kv_base4 + (col >> 2)] * QKV_SC;
+                s_k[kv_r * 128u + col + 0u] = float16_t(vk.x); s_k[kv_r * 128u + col + 1u] = float16_t(vk.y);
+                s_k[kv_r * 128u + col + 2u] = float16_t(vk.z); s_k[kv_r * 128u + col + 3u] = float16_t(vk.w);
+                s_v[kv_r * 128u + col + 0u] = float16_t(vv.x); s_v[kv_r * 128u + col + 1u] = float16_t(vv.y);
+                s_v[kv_r * 128u + col + 2u] = float16_t(vv.z); s_v[kv_r * 128u + col + 3u] = float16_t(vv.w);
+            }
+        } else {
+            for (uint p = 0u; p < 2u; ++p) {
+                uint col = p * 64u + kv_c4;
+                s_k[kv_r * 128u + col + 0u] = float16_t(0.0); s_k[kv_r * 128u + col + 1u] = float16_t(0.0);
+                s_k[kv_r * 128u + col + 2u] = float16_t(0.0); s_k[kv_r * 128u + col + 3u] = float16_t(0.0);
+                s_v[kv_r * 128u + col + 0u] = float16_t(0.0); s_v[kv_r * 128u + col + 1u] = float16_t(0.0);
+                s_v[kv_r * 128u + col + 2u] = float16_t(0.0); s_v[kv_r * 128u + col + 3u] = float16_t(0.0);
+            }
+        }
+        barrier();
+
+        bool tile_active = sub_valid && (j0 <= sub_pos_hi) && (pc.is_glob != 0u || sub_pos0 < j0 + tile_n - 1u + 1024u);
+        if (tile_active) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sm = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> km;
+            coopMatLoad(km, s_k,   0u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q0, km, sm);
+            coopMatLoad(km, s_k,  16u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q1, km, sm);
+            coopMatLoad(km, s_k,  32u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q2, km, sm);
+            coopMatLoad(km, s_k,  48u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q3, km, sm);
+            coopMatLoad(km, s_k,  64u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q4, km, sm);
+            coopMatLoad(km, s_k,  80u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q5, km, sm);
+            coopMatLoad(km, s_k,  96u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q6, km, sm);
+            coopMatLoad(km, s_k, 112u, 128u, gl_CooperativeMatrixLayoutColumnMajor); sm = coopMatMulAdd(q7, km, sm);
+            coopMatStore(sm, s_s[sub], 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupBarrier();
+
+            bool row_ok = (sub_t0 + qr < pc.B);
+            bool far_row = (pos_q >= j0 + tile_n - 1u + 1024u);
+
+            float sv0=-1e30, sv1=-1e30, sv2=-1e30, sv3=-1e30;
+            #define LOAD_SCORE(U, DST) { \
+                uint kk = k_base + U; \
+                if (row_ok && kk < tile_n) { \
+                    uint j = j0 + kk; \
+                    if (j <= pos_q && (pc.is_glob != 0u || (pos_q - j) < 1024u)) { \
+                        float val = s_s[sub][qr * 16u + kk] * sc; \
+                        if (!far_row) { \
+                            uint d = pos_q - j; \
+                            if (d < 1024u) { \
+                                float rb_v = 0.0; \
+                                uint rb_off = d * 8u; \
+                                for (uint i = 0u; i < 8u; ++i) { \
+                                    uint p2 = rp.v[rb_off + i]; \
+                                    rb_v += s_r[sub][qr * 16u + i * 2u + 0u] * uintBitsToFloat((p2 & 0xFFFFu) << 16); \
+                                    rb_v += s_r[sub][qr * 16u + i * 2u + 1u] * uintBitsToFloat(p2 & 0xFFFF0000u); \
+                                } \
+                                val += rb_v; \
+                            } \
+                        } \
+                        DST = val; \
+                    } \
+                } \
+            }
+            LOAD_SCORE(0u, sv0) LOAD_SCORE(1u, sv1) LOAD_SCORE(2u, sv2) LOAD_SCORE(3u, sv3)
+
+            float mx_tile = max(max(sv0, sv1), max(sv2, sv3));
+            mx_tile = max(mx_tile, subgroupShuffleXor(mx_tile, 1u));
+            mx_tile = max(mx_tile, subgroupShuffleXor(mx_tile, 2u));
+
+            float m_new = max(m_prev, mx_tile);
+            float alpha = (l_prev > 0.0 && m_new > m_prev) ? exp(m_prev - m_new) : 1.0;
+            bool need_rescale = (l_prev > 0.0 && m_new > m_prev);
+
+            float p0 = (sv0 > -1e29) ? exp(sv0 - m_new) : 0.0;
+            float p1 = (sv1 > -1e29) ? exp(sv1 - m_new) : 0.0;
+            float p2 = (sv2 > -1e29) ? exp(sv2 - m_new) : 0.0;
+            float p3 = (sv3 > -1e29) ? exp(sv3 - m_new) : 0.0;
+
+            s_p[sub][qr * 16u + k_base + 0u] = float16_t(p0);
+            s_p[sub][qr * 16u + k_base + 1u] = float16_t(p1);
+            s_p[sub][qr * 16u + k_base + 2u] = float16_t(p2);
+            s_p[sub][qr * 16u + k_base + 3u] = float16_t(p3);
+
+            float ps_tot = (p0 + p1) + (p2 + p3);
+            ps_tot += subgroupShuffleXor(ps_tot, 1u);
+            ps_tot += subgroupShuffleXor(ps_tot, 2u);
+            l_prev = l_prev * alpha + ps_tot;
+            m_prev = m_new;
+            if (qtr == 0u) s_alpha[sub][qr] = alpha;
+            subgroupBarrier();
+
+            if (subgroupAny(need_rescale)) {
+                float a_r = s_alpha[sub][qr];
+                #define RESCALE_O(OM) { \
+                    coopMatStore(OM, s_s[sub], 0u, 16u, gl_CooperativeMatrixLayoutRowMajor); \
+                    subgroupBarrier(); \
+                    s_s[sub][qr * 16u + k_base + 0u] *= a_r; \
+                    s_s[sub][qr * 16u + k_base + 1u] *= a_r; \
+                    s_s[sub][qr * 16u + k_base + 2u] *= a_r; \
+                    s_s[sub][qr * 16u + k_base + 3u] *= a_r; \
+                    subgroupBarrier(); \
+                    coopMatLoad(OM, s_s[sub], 0u, 16u, gl_CooperativeMatrixLayoutRowMajor); \
+                }
+                RESCALE_O(o0) RESCALE_O(o1) RESCALE_O(o2) RESCALE_O(o3)
+                RESCALE_O(o4) RESCALE_O(o5) RESCALE_O(o6) RESCALE_O(o7)
+            }
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pm;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vm;
+            coopMatLoad(pm, s_p[sub], 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(vm, s_v,   0u, 128u, gl_CooperativeMatrixLayoutRowMajor); o0 = coopMatMulAdd(pm, vm, o0);
+            coopMatLoad(vm, s_v,  16u, 128u, gl_CooperativeMatrixLayoutRowMajor); o1 = coopMatMulAdd(pm, vm, o1);
+            coopMatLoad(vm, s_v,  32u, 128u, gl_CooperativeMatrixLayoutRowMajor); o2 = coopMatMulAdd(pm, vm, o2);
+            coopMatLoad(vm, s_v,  48u, 128u, gl_CooperativeMatrixLayoutRowMajor); o3 = coopMatMulAdd(pm, vm, o3);
+            coopMatLoad(vm, s_v,  64u, 128u, gl_CooperativeMatrixLayoutRowMajor); o4 = coopMatMulAdd(pm, vm, o4);
+            coopMatLoad(vm, s_v,  80u, 128u, gl_CooperativeMatrixLayoutRowMajor); o5 = coopMatMulAdd(pm, vm, o5);
+            coopMatLoad(vm, s_v,  96u, 128u, gl_CooperativeMatrixLayoutRowMajor); o6 = coopMatMulAdd(pm, vm, o6);
+            coopMatLoad(vm, s_v, 112u, 128u, gl_CooperativeMatrixLayoutRowMajor); o7 = coopMatMulAdd(pm, vm, o7);
+        }
+        barrier();
+    }
+
+    if (sub_valid) {
+        uint gt = sub_t0 + qr;
+        bool row_ok = (gt < pc.B);
+        float w = 0.0, inv_l = 0.0;
+        if (row_ok) {
+            float sk = sb.v[gt * 24u + h];
+            float mg = max(sk, m_prev);
+            w = (l_prev > 0.0) ? exp(m_prev - mg) : 0.0;
+            inv_l = 16.0 / (exp(sk - mg) + l_prev * w); // undo QKV_SC = 1/16 on V
+        }
+        uint ob_base = gt * 3072u + h * 128u;
+        #define STORE_O(OM, D_OFF) { \
+            coopMatStore(OM, s_s[sub], 0u, 16u, gl_CooperativeMatrixLayoutRowMajor); \
+            subgroupBarrier(); \
+            if (row_ok) { \
+                for (uint u = 0u; u < 4u; ++u) { \
+                    uint d = D_OFF + k_base + u; \
+                    float val = (s_s[sub][qr * 16u + k_base + u] * w) * inv_l; \
+                    ob.v[ob_base + d] = val / (1.0 + exp(-gb.v[ob_base + d])); \
+                } \
+            } \
+            subgroupBarrier(); \
+        }
+        STORE_O(o0,   0u) STORE_O(o1,  16u) STORE_O(o2,  32u) STORE_O(o3,  48u)
+        STORE_O(o4,  64u) STORE_O(o5,  80u) STORE_O(o6,  96u) STORE_O(o7, 112u)
+    }
+}
