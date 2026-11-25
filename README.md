@@ -1,4 +1,4 @@
-> **v2 Clean Build (RDNA 4 Hardware WMMA + 32-Split Shared-KV + Standalone C++17)** is in [`v2/`](v2/). Original `v1` files remain in the repository root.
+> **Repository structure:** [`v2/`](v2/) contains the standalone C++17 + GLSL WMMA clean build (recommended), and [`v1/`](v1/) contains the original Python/C WGSL + FP8 KV + CPU ViT implementation.
 
 # Inkling-2-Mini Raw Vulkan Engine (`v2` Clean Build)
 
