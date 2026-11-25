@@ -42,7 +42,7 @@ static constexpr int N_EXPERTS   = 128;
 static constexpr int TOP_K       = 8;
 static constexpr int INTER_SIZE  = 1152;
 static constexpr int VOCAB_ACT   = 200058;
-static constexpr int MAX_BATCH   = 256;
+static constexpr int MAX_BATCH   = 1024;
 
 static constexpr float QK_CLIP         = 22.627416997969522f;
 static constexpr float REL_CLIP        = 8.0f;
@@ -1796,7 +1796,7 @@ int main(int argc, char** argv) {
     std::string model_path = std::string(getenv("HOME")) + "/models/Inkling-2-Mini/model-00001-of-00001.safetensors";
     std::string shader_dir = std::string(getenv("HOME")) + "/inkling2/shaders";
     std::vector<int> prompt_tokens;
-    int steps = 20, max_ctx = 4096, prefill_batch = 256, spec_k = 7;
+    int steps = 20, max_ctx = 4096, prefill_batch = MAX_BATCH, spec_k = 7;
     bool check_vram = false, profile = false, dump_logits = false, use_spec = false, stdio_server = false, use_fp8 = false;
 
     for (int i = 1; i < argc; ++i) {

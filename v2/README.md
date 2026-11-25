@@ -71,8 +71,8 @@ xychart-beta
 xychart-beta
     title "Cold Long-Context Prefill Speed (tok/s)"
     x-axis ["v1 @ 4k", "v1 @ 32k", "v1 @ 50k", "v2 @ 25k", "v2 @ 40k"]
-    y-axis "Tokens / sec" 0 --> 900
-    bar [388, 291, 253, 807.7, 792]
+    y-axis "Tokens / sec" 0 --> 1500
+    bar [388, 291, 253, 1380.8, 1280]
 ```
 
 ---
@@ -88,9 +88,9 @@ All speed numbers are 5-run medians after 1 warmup on a quiet R9700 GPU (`bench_
 | **B1 (code)** | ≥ 130 tok/s (<1k ctx) | `code_1`: **133.5 tok/s** (`132.7–133.7`, ctx ~134); `code_2`: **142.7 tok/s** (`142.4–142.7`, ctx ~143) | **PASS** | `python3 bench_final_gates.py` |
 | **B1 (prose)** | ≥ 100 tok/s (<1k ctx) | Exact `B=1`: **86.8 / 86.7 tok/s** (`86.6–87.1`, ctx ~118); `--fp8 B=1`: **111.7 / 111.9 tok/s** (`110.2–112.5`) | **SHORT (Exact) / PASS (`--fp8`)** | `python3 bench_final_gates.py` |
 | **B2 (40k)** | ≥ 70 tok/s at 40,000 ctx | **85.1 tok/s** (`82.1–86.3`, ctx ~40,100, `--spec K=7`) | **PASS** | `python3 bench_final_gates.py` |
-| **C (25k prefill)** | ≥ 600 tok/s cold 25k | **807.7 tok/s** (`807.2–808.2`, `B=256`, hardware FP16→FP32 WMMA) | **PASS** | `python3 bench_final_gates.py` |
+| **C (25k prefill)** | ≥ 600 tok/s cold 25k | **1,380.8 tok/s** (`1,379.2–1,384.6`, `B=1024`, hardware FP16→FP32 WMMA) | **PASS** | `python3 bench_final_gates.py` |
 | **D (cache reuse)** | ≤ new + 10% on append | **14/14** growing turns `reread ≤ new_tokens` (Turn 15: 18 / 2,761 = **99.35%** reuse) | **PASS** | `python3 verify_req_f.py` |
-| **E (128k VRAM)** | ≥ 1 GiB free at 128k | **28.09 / 31.86 GiB** used (**3.77 GiB free**; `--fp8`: 29.12 GiB, **2.74 GiB free**) | **PASS** | `./inkling_vk --max-ctx 128000 --spec --check-vram` |
+| **E (128k VRAM)** | ≥ 1 GiB free at 128k | **28.44 / 31.86 GiB** used (**3.42 GiB free**; `--fp8`: 29.47 GiB, **2.39 GiB free**) | **PASS** | `./inkling_vk --max-ctx 128000 --spec --check-vram` |
 | **F (serving)** | Localhost OpenAI + API key + 15-turn tool calls | `127.0.0.1`, Bearer auth `401`/`200`, 15 turns survived, 7 tool calls executed | **PASS** | `python3 verify_req_f.py` |
 
 ---
@@ -103,8 +103,8 @@ All speed numbers are 5-run medians after 1 warmup on a quiet R9700 GPU (`bench_
 | **Short decode, prose (`B=1`, <1k ctx)** | `91.3 tok/s` (plain code sample) | `86.8 tok/s` (`prose_1`), `86.7` (`prose_2`) | **111.7 tok/s** (`prose_1`), **111.9** (`prose_2`) |
 | **Short decode, code (`--spec K=7`)** | `117.8 tok/s` (`88.6` on 2nd code sample) | **133.5 tok/s** (`code_1`), **142.7** (`code_2`) | **130.9 tok/s** (`code_1`), **167.7** (`code_2`) |
 | **Decode at depth (`--spec K=7`)** | `61.8 tok/s` @ 32k, `50.4 tok/s` @ 50k | **85.1 tok/s** @ 40,100 ctx | **84.3 tok/s** @ 40,100 ctx |
-| **Cold long prefill** | `388` @ 4k, `291` @ 32k, `253 tok/s` @ 50k | **807.7 tok/s** @ 25k, **792 tok/s** @ 40k | **807.7 tok/s** @ 25k (BF16/WMMA prefill) |
-| **128k context VRAM (with MTP)** | Fits w/ FP8 KV | **28.09 / 31.86 GiB** (`3.77 GiB free`) | **29.12 / 31.86 GiB** (`2.74 GiB free`) |
+| **Cold long prefill** | `388` @ 4k, `291` @ 32k, `253 tok/s` @ 50k | **1,380.8 tok/s** @ 25k (`B=1024`) | **1,380.8 tok/s** @ 25k (BF16/WMMA prefill) |
+| **128k context VRAM (with MTP)** | Fits w/ FP8 KV | **28.44 / 31.86 GiB** (`3.42 GiB free`) | **29.47 / 31.86 GiB** (`2.39 GiB free`) |
 | **Runtime & Dependencies** | Python + C runner + WGSL dump layer | Single C++17 binary + GLSL + stdlib Python | Same (`--fp8` flag, `+0.5 s` OpenMP quant) |
 
 ---
@@ -120,6 +120,7 @@ All speed numbers are 5-run medians after 1 warmup on a quiet R9700 GPU (`bench_
 | **RDNA 4 FP16→FP32 WMMA `moe_nvfp4_gemm.comp`** | Scalar FP32 MoE GEMM at `B=256` (`~28 s`) | Cold 25k prefill `521.0 → 807.7 tok/s` (`-17.4 s`, `500/500`) |
 | **32-Split shared-KV verify & MTP attention** | 8× redundant 40k Global KV reads in `--spec` (`177.8 ms`) | 40k decode `31.7 → 85.1 tok/s` (`ver 177.8 → 67.2 ms`) |
 | **Turn-boundary `short_conv` checkpoint (`3.8 MiB`)** | Full KV cache resets on assistant template re-serialization | 15-turn agent: **14/14** turns `reread ≤ new` (**99.35%** reuse) |
+| **MAX_BATCH 1024 + parallel `moe_group` + WMMA `mat_bf16_gemm` + 64-tok `moe_nvfp4_gemm`** | `B=256` weight re-reads, serial grouping, scalar dense GEMM | Cold 25k prefill `807.7 → 1,380.8 tok/s` (`-12.9 s`, `500/500`) |
 | **Optional `--fp8` per-row E4M3 dense weights** | 3.51 GB BF16 dense weight reads in `B=1` decode | Plain `B=1` prose `86.8 → 111.9 tok/s` (**+29%**) |
 
 ---

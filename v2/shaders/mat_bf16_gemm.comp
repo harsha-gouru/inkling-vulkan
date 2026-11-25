@@ -1,13 +1,15 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-// 64x64x32 coalesced BF16 GEMM:
-// WG: 16x16 = 256 threads; each thread computes 4 rows x 4 tokens = 64x64 output tile!
-// Cooperative load per K_TILE=32:
-//   - s_w[64][33]: 256 threads = 64 rows x 4 threads/row; each thread loads 1 uvec4 = 8 BF16 (16B) -> 64B/row coalesced!
-//   - s_x[64][33]: 256 threads = 32 rows x 8 threads/row x 2 passes; each thread loads 1 vec4 (16B) -> 128B/row coalesced!
-// Grid: ((rows+63)/64, (B+63)/64, 1)
-layout(local_size_x = 16, local_size_y = 16) in;
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// 64x64x32 Scaled FP16->FP32 WMMA Dense BF16 GEMM (Wave64-native):
+// WG: 64 x 4 = 256 threads = 4 Wave64 subgroups, each owning 16 rows x 64 tokens (four 16x16 FP32 accumulators).
+// LDS: 12 KiB -> 5 WGs/CU! Grid: ((rows+63)/64, (B+63)/64, 1)
+layout(local_size_x = 64, local_size_y = 4) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
@@ -22,85 +24,115 @@ layout(push_constant) uniform PC {
     uint B;
 } pc;
 
-shared float s_w[32][65]; // transposed [k][r] so s_w[k][r0..r0+3] is contiguous & conflict-free!
-shared float s_x[32][65]; // transposed [k][t] so s_x[k][t0..t0+3] is contiguous & conflict-free!
+shared float16_t s_w[64 * 32];    // 4 KiB: [r 0..63][k 0..31]
+shared float16_t s_x[64 * 32];    // 4 KiB: [t 0..63][k 0..31]
+shared float     s_c[4][16 * 16]; // 4 KiB: epilogue scratch per subgroup
 
 vec2 ub2(uint p) { return vec2(uintBitsToFloat((p & 0xFFFFu) << 16), uintBitsToFloat(p & 0xFFFF0000u)); }
 
 void main() {
-    uint tx = gl_LocalInvocationID.x; // 0..15 (tokens)
-    uint ty = gl_LocalInvocationID.y; // 0..15 (rows)
-    uint lid = ty * 16u + tx;         // 0..255
+    uint lane = gl_LocalInvocationID.x; // 0..63 (one Wave64 subgroup)
+    uint sub  = gl_LocalInvocationID.y; // 0..3
+    uint lid  = sub * 64u + lane;       // 0..255
 
     uint r_base = gl_WorkGroupID.x * 64u;
     uint t_base = gl_WorkGroupID.y * 64u;
 
-    float c00=0,c01=0,c02=0,c03=0;
-    float c10=0,c11=0,c12=0,c13=0;
-    float c20=0,c21=0,c22=0,c23=0;
-    float c30=0,c31=0,c32=0,c33=0;
+    uint wr_local = lid >> 2; // 0..63
+    uint wk_v8    = lid & 3u; // 0..3 -> 8 BF16s
+    uint gr       = r_base + wr_local;
 
-    uint wr_local = lid >> 2;         // 0..63
-    uint wk_v8    = lid & 3u;         // 0..3 -> 8 BF16s (k = wk_v8*8 .. +7)
-    uint gr = r_base + wr_local;
-
-    uint xr_local = lid >> 3;         // 0..31 (2 passes for 0..63)
-    uint xk_v4    = lid & 7u;         // 0..7 -> 4 F32s (k = xk_v4*4 .. +3)
+    uint xr_local = lid >> 3; // 0..31 (2 passes for 0..63)
+    uint xk_v4    = lid & 7u; // 0..7 -> 4 F32s
     uint cols_v8  = pc.cols >> 3;
     uint cols_v4  = pc.cols >> 2;
 
     UVec4In wb = UVec4In(pc.w_addr);
     Vec4In  xb = Vec4In(pc.x_addr);
 
+    const float X_SC   = 0.0625; // 1/16 to guarantee zero FP16 overflow
+    const float X_UNSC = 16.0;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 = c0, c2 = c0, c3 = c0;
+
+    uint nt_wg = (t_base < pc.B) ? min(64u, pc.B - t_base) : 0u;
+
     for (uint k0 = 0u; k0 < pc.cols; k0 += 32u) {
-        // Load W[64, 32] -> s_w[32][65]
-        uint k_off = wk_v8 * 8u;
+        // Load W[64, 32] BF16 -> s_w FP16 (coalesced 64B/row)
+        uint sw_off = wr_local * 32u + wk_v8 * 8u;
         if (gr < pc.rows) {
             uvec4 w = wb.v[uint(uint64_t(gr) * uint64_t(cols_v8) + uint64_t((k0 >> 3) + wk_v8))];
             vec2 a = ub2(w.x), b = ub2(w.y), c = ub2(w.z), d = ub2(w.w);
-            s_w[k_off+0u][wr_local]=a.x; s_w[k_off+1u][wr_local]=a.y;
-            s_w[k_off+2u][wr_local]=b.x; s_w[k_off+3u][wr_local]=b.y;
-            s_w[k_off+4u][wr_local]=c.x; s_w[k_off+5u][wr_local]=c.y;
-            s_w[k_off+6u][wr_local]=d.x; s_w[k_off+7u][wr_local]=d.y;
+            s_w[sw_off + 0u] = float16_t(a.x); s_w[sw_off + 1u] = float16_t(a.y);
+            s_w[sw_off + 2u] = float16_t(b.x); s_w[sw_off + 3u] = float16_t(b.y);
+            s_w[sw_off + 4u] = float16_t(c.x); s_w[sw_off + 5u] = float16_t(c.y);
+            s_w[sw_off + 6u] = float16_t(d.x); s_w[sw_off + 7u] = float16_t(d.y);
         } else {
-            for (uint u=0u; u<8u; ++u) s_w[k_off+u][wr_local] = 0.0;
+            for (uint u = 0u; u < 8u; ++u) s_w[sw_off + u] = float16_t(0.0);
         }
-        // Load X[64, 32] -> s_x[32][65] in 2 coalesced 128-byte bursts
+        // Load X[64, 32] F32 -> s_x FP16 in 2 coalesced 128B bursts
         uint xk = xk_v4 * 4u;
+        uint sx0 = xr_local * 32u + xk;
         uint gt0 = t_base + xr_local;
         if (gt0 < pc.B) {
-            vec4 xv = xb.v[gt0 * cols_v4 + (k0 >> 2) + xk_v4];
-            s_x[xk+0u][xr_local]=xv.x; s_x[xk+1u][xr_local]=xv.y; s_x[xk+2u][xr_local]=xv.z; s_x[xk+3u][xr_local]=xv.w;
+            vec4 xv = xb.v[gt0 * cols_v4 + (k0 >> 2) + xk_v4] * X_SC;
+            s_x[sx0 + 0u] = float16_t(xv.x); s_x[sx0 + 1u] = float16_t(xv.y);
+            s_x[sx0 + 2u] = float16_t(xv.z); s_x[sx0 + 3u] = float16_t(xv.w);
         } else {
-            s_x[xk+0u][xr_local]=0.0; s_x[xk+1u][xr_local]=0.0; s_x[xk+2u][xr_local]=0.0; s_x[xk+3u][xr_local]=0.0;
+            s_x[sx0 + 0u] = float16_t(0.0); s_x[sx0 + 1u] = float16_t(0.0);
+            s_x[sx0 + 2u] = float16_t(0.0); s_x[sx0 + 3u] = float16_t(0.0);
         }
+        uint sx1 = (xr_local + 32u) * 32u + xk;
         uint gt1 = gt0 + 32u;
         if (gt1 < pc.B) {
-            vec4 xv = xb.v[gt1 * cols_v4 + (k0 >> 2) + xk_v4];
-            s_x[xk+0u][xr_local+32u]=xv.x; s_x[xk+1u][xr_local+32u]=xv.y; s_x[xk+2u][xr_local+32u]=xv.z; s_x[xk+3u][xr_local+32u]=xv.w;
+            vec4 xv = xb.v[gt1 * cols_v4 + (k0 >> 2) + xk_v4] * X_SC;
+            s_x[sx1 + 0u] = float16_t(xv.x); s_x[sx1 + 1u] = float16_t(xv.y);
+            s_x[sx1 + 2u] = float16_t(xv.z); s_x[sx1 + 3u] = float16_t(xv.w);
         } else {
-            s_x[xk+0u][xr_local+32u]=0.0; s_x[xk+1u][xr_local+32u]=0.0; s_x[xk+2u][xr_local+32u]=0.0; s_x[xk+3u][xr_local+32u]=0.0;
+            s_x[sx1 + 0u] = float16_t(0.0); s_x[sx1 + 1u] = float16_t(0.0);
+            s_x[sx1 + 2u] = float16_t(0.0); s_x[sx1 + 3u] = float16_t(0.0);
         }
         barrier();
 
-        uint r0 = ty * 4u, t0 = tx * 4u;
-        for (uint k = 0u; k < 32u; ++k) {
-            float w0 = s_w[k][r0+0u], w1 = s_w[k][r0+1u], w2 = s_w[k][r0+2u], w3 = s_w[k][r0+3u];
-            float x0 = s_x[k][t0+0u], x1 = s_x[k][t0+1u], x2 = s_x[k][t0+2u], x3 = s_x[k][t0+3u];
-            c00 += w0*x0; c01 += w0*x1; c02 += w0*x2; c03 += w0*x3;
-            c10 += w1*x0; c11 += w1*x1; c12 += w1*x2; c13 += w1*x3;
-            c20 += w2*x0; c21 += w2*x1; c22 += w2*x2; c23 += w2*x3;
-            c30 += w3*x0; c31 += w3*x1; c32 += w3*x2; c33 += w3*x3;
-        }
+        // WMMA: 2 K-steps of 16 x up to 4 N-tiles of 16
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+        uint a_base = sub * 16u * 32u;
+
+        coopMatLoad(a, s_w, a_base + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, s_x,  0u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c0 = coopMatMulAdd(a, b, c0);
+        if (nt_wg > 16u) { coopMatLoad(b, s_x, 16u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c1 = coopMatMulAdd(a, b, c1); }
+        if (nt_wg > 32u) { coopMatLoad(b, s_x, 32u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c2 = coopMatMulAdd(a, b, c2); }
+        if (nt_wg > 48u) { coopMatLoad(b, s_x, 48u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c3 = coopMatMulAdd(a, b, c3); }
+
+        coopMatLoad(a, s_w, a_base + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, s_x,  0u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c0 = coopMatMulAdd(a, b, c0);
+        if (nt_wg > 16u) { coopMatLoad(b, s_x, 16u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c1 = coopMatMulAdd(a, b, c1); }
+        if (nt_wg > 32u) { coopMatLoad(b, s_x, 32u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c2 = coopMatMulAdd(a, b, c2); }
+        if (nt_wg > 48u) { coopMatLoad(b, s_x, 48u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c3 = coopMatMulAdd(a, b, c3); }
         barrier();
     }
 
+    // Epilogue: store 16x16 tiles to global F32 output
     F32Out yb = F32Out(pc.y_addr);
-    uint r0 = r_base + ty * 4u;
-    uint t0 = t_base + tx * 4u;
-    #define ST(DR, DT, VAL) if (r0 + DR < pc.rows && t0 + DT < pc.B) yb.v[(t0 + DT) * pc.rows + (r0 + DR)] = VAL;
-    ST(0u,0u,c00) ST(0u,1u,c01) ST(0u,2u,c02) ST(0u,3u,c03)
-    ST(1u,0u,c10) ST(1u,1u,c11) ST(1u,2u,c12) ST(1u,3u,c13)
-    ST(2u,0u,c20) ST(2u,1u,c21) ST(2u,2u,c22) ST(2u,3u,c23)
-    ST(3u,0u,c30) ST(3u,1u,c31) ST(3u,2u,c32) ST(3u,3u,c33)
+    uint rl = lane >> 2;         // 0..15
+    uint t0 = (lane & 3u) * 4u;  // 0,4,8,12
+    uint gr_o = r_base + sub * 16u + rl;
+
+    #define STORE_TILE(CM, T_OFF) { \
+        coopMatStore(CM, s_c[sub], 0u, 16u, gl_CooperativeMatrixLayoutRowMajor); \
+        subgroupBarrier(); \
+        if (gr_o < pc.rows) { \
+            for (uint u = 0u; u < 4u; ++u) { \
+                uint gt = t_base + T_OFF + t0 + u; \
+                if (gt < pc.B) yb.v[gt * pc.rows + gr_o] = s_c[sub][rl * 16u + t0 + u] * X_UNSC; \
+            } \
+        } \
+        subgroupBarrier(); \
+    }
+    STORE_TILE(c0,  0u)
+    if (nt_wg > 16u) STORE_TILE(c1, 16u)
+    if (nt_wg > 32u) STORE_TILE(c2, 32u)
+    if (nt_wg > 48u) STORE_TILE(c3, 48u)
 }

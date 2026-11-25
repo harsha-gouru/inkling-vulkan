@@ -616,3 +616,43 @@ Before I measure the single-stream Vulkan GPU engine in Stage 2: **with 5.494 GB
    - `code_2` (`--spec K=7`, ctx ~143): **142.7 -> 167.7 tok/s** (spread `167.3–168.0`, **+17.5%**)
    - `long40k` (`--spec K=7`, ctx ~40,100): **85.1 -> 84.3 tok/s** (spread `82.4–85.1`, neutral at 40k since KV is FP32)
 8. **Cost and range:** +1.03 GiB VRAM (`29.12 / 31.86 GiB` used at 128k, `2.74 GiB free`).
+
+### Optimization 39 (Stage 4): Raise `MAX_BATCH` from `256` to `1024`
+1. **Target:** C (cold 25,000-token prompt reading; currently `807.7 tok/s`).
+2. **Breakdown:** At `B=256`, cold 25k prefill runs 98 chunks, reading all 128 MoE experts (`29.44 GB`, `avg cnt = 16` tokens/expert) 98 times (`~115 MB/tok`).
+3. **Ceiling:** At `B=1024`, cold 25k prefill runs only 25 chunks (`avg cnt = 64` tokens/expert), cutting MoE weight traffic 4× (from `~115 MB/tok` -> `~29 MB/tok`) and BF16 dense weight reads 4×.
+4. **Limiter:** `MAX_BATCH = 256` chunk size limiting arithmetic intensity on MoE experts (`avg cnt=16`) and dense projections.
+5. **Prediction:** Raising `MAX_BATCH` (and default `prefill_batch`) from `256 -> 1024` will lift cold 25,000-token prefill from **807.7 tok/s -> ~1,000–1,350 tok/s**, at a scratch VRAM cost of ~+340 MiB (still >3.4 GiB free at 128k).
+6. **Change:** Raised `MAX_BATCH` (and default `prefill_batch`) from `256` to `1024` in `inkling_vk.cpp`.
+7. **Check:** `verify_req_a_short.py` **500/500 PASS** (`measured`). Cold 25,000-token prefill jumped **807.7 -> 967.4 tok/s** (`30.95 s -> 25.84 s`, **+19.8%**, spread `966.6–970.1 tok/s`, warmup `977.4 tok/s`, identical `GENERATED: 159272` on all 6 runs) (`measured`). Slightly below the 1,000–1,350 tok/s prediction because `moe_nvfp4_gemm.comp` still uses a `32`-token tile (2 passes per expert at `avg cnt=64`) and `moe_group_batch.comp` scans `8,192` pairs serially in 1 WG.
+8. **Cost and range:** +325 MiB scratch VRAM (`442.4 MiB` total); 128k VRAM with MTP is **28.44 / 31.86 GiB (`3.42 GiB free`)** (`measured`).
+
+### Optimization 40 (Stage 4): Parallel LDS-histogram `moe_group_batch.comp`
+1. **Target:** C (cold 25,000-token prefill at `B=1024`; currently `967.4 tok/s`, `25.84 s`).
+2. **Breakdown:** At `B=1024`, `moe_group_batch.comp` launches 1 WG of 128 threads where EVERY thread scans all `8,192` pairs twice (`16,384` serial global reads/thread × 48 layers × 25 chunks = 1,200 launches).
+3. **Ceiling:** 256 threads coalesced-reading `8,192` pairs (`32` reads/thread) with LDS `atomicAdd` histogram + scatter cuts `moe_group_batch` from ~2–6 s -> <0.02 s.
+4. **Limiter:** Serial `O(B * 8)` per-thread scan in `moe_group_batch.comp`.
+5. **Prediction:** Rewriting `moe_group_batch.comp` with 256 threads doing coalesced stride-256 LDS histogram + prefix sum + parallel scatter will save **2–6 s**, lifting cold 25k prefill from **967.4 tok/s -> ~1,050–1,250 tok/s**.
+6. **Change:** Rewrote `shaders/moe_group_batch.comp` with 256-thread coalesced LDS `atomicAdd` histogram + prefix sum + parallel scatter.
+7. **Check:** `verify_req_a_short.py` **500/500 PASS** (`measured`). Cold 25,000-token prefill (`B=1024`) improved **967.4 -> 1,000.4 tok/s** (`25.84 s -> 24.99 s`, **-0.85 s**, spread `999.6–1,002.9 tok/s`, warmup `1,010.4 tok/s`, `GENERATED: 159272`) (`measured`). Saved less than 2–6 s because `moe_group_batch` was ~0.85 s of the 25.8 s total; crossing 1,000 tok/s cleanly!
+8. **Cost and range:** 0 extra VRAM.
+
+### Optimization 41 (Stage 4): Scaled FP16->FP32 WMMA (`64x64x32`) dense GEMM (`mat_bf16_gemm.comp`)
+1. **Target:** C (cold 25,000-token prefill at `B=1024`; currently `1,000.4 tok/s`, `24.99 s`).
+2. **Breakdown:** Dense attention projections (`wq/wk/wv/wr/sink/gate/wo`, 64.8 TFLOPs across 25k tokens) still run on scalar FP32 ALUs in `mat_bf16_gemm.comp`, taking ~6–8 s of the remaining 25.0 s.
+3. **Ceiling:** Moving `mat_bf16_gemm.comp` onto RDNA 4 `16x16x16` FP16->FP32 WMMA (Wave64 `64x4`, 12 KiB LDS = 5 WGs/CU) drops dense GEMM from ~7 s -> ~1.0–1.5 s (-5.5 to -6.0 s).
+4. **Limiter:** Scalar FP32 FMA inner loop in `mat_bf16_gemm.comp`.
+5. **Prediction:** Rewriting `mat_bf16_gemm.comp` with Wave64 `64x64x32` scaled FP16->FP32 WMMA (`X * 1/16`, 4 subgroups × `16x64` output) will save **5–8 s**, lifting cold 25,000-token prefill from **1,000.4 tok/s -> ~1,250–1,450 tok/s** while staying exact (`500/500`).
+6. **Change:** Rewrote `shaders/mat_bf16_gemm.comp` with Wave64 (`64x4`, 12 KiB LDS = 5 WGs/CU) `64x64x32` scaled FP16->FP32 WMMA (`X * 1/16`, 4 subgroups × `16x64` output).
+7. **Check:** `verify_req_a_short.py` **500/500 PASS** (`measured`); `code_1` (`B=34`) vs `B=1` `max_diff=2.06e-1`, argmax exact (`198==198`). Cold 25,000-token prefill (`B=1024`) jumped **1,000.4 -> 1,161.5 tok/s** (`24.99 s -> 21.52 s`, **-3.47 s**, spread `1,160.4–1,163.4 tok/s`, warmup `1,169.7 tok/s`, `GENERATED: 159272`) (`measured`).
+8. **Cost and range:** 0 extra VRAM.
+
+### Optimization 42 (Stage 4): 64-token WMMA tiles (`64x64x32`) in `moe_nvfp4_gemm.comp`
+1. **Target:** C (cold 25,000-token prefill at `B=1024`; currently `1,161.5 tok/s`, `21.52 s`).
+2. **Breakdown:** At `B=1024`, average active expert count is `cnt = 64`. `moe_nvfp4_gemm.comp` currently processes `p0 += 32` (re-reading every expert's NVFP4 weights 2–3× per chunk!).
+3. **Ceiling:** Widening `moe_nvfp4_gemm.comp` from `64x32x32 -> 64x64x32` (12 KiB LDS = 5 WGs/CU, skipping unused 16-token tiles when `np <= 16/32/48`) halves NVFP4 weight reads & dequant work at `B=1024`, saving ~2–4 s.
+4. **Limiter:** 32-token `p0` loop in `moe_nvfp4_gemm.comp` causing 2× redundant NVFP4 weight loads & E4M3/FP4 dequantization at `B=1024`.
+5. **Prediction:** Widening `moe_nvfp4_gemm.comp` to `64x64x32` will save **2–4 s**, lifting cold 25,000-token prefill from **1,161.5 tok/s -> ~1,280–1,430 tok/s**.
+6. **Change:** Widened `shaders/moe_nvfp4_gemm.comp` from `64x32x32 -> 64x64x32` (12.5 KiB LDS = 5 WGs/CU, 4 accumulators/subgroup, skipping unused 16-token tiles when `np <= 16/32/48`).
+7. **Check:** `verify_req_a_short.py` **500/500 PASS** (`measured`). Cold 25,000-token prefill (`B=1024`) jumped **1,161.5 -> 1,380.8 tok/s** (`21.52 s -> 18.10 s`, **-3.42 s**, spread `1,379.2–1,384.6 tok/s`, warmup `1,394.7 tok/s`, identical `GENERATED: 159272` on all 6 runs) (`measured`). Right in the middle of our `1,280–1,430 tok/s` prediction!
+8. **Cost and range:** 0 extra VRAM (`28.44 / 31.86 GiB` at 128k, `3.42 GiB free`).

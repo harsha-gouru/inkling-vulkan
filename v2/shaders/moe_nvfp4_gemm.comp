@@ -6,9 +6,9 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// 64x32x32 Scaled FP16->FP32 WMMA NVFP4 MoE GEMM (Wave64-native):
-// WG: 64 x 4 = 256 threads = 4 Wave64 subgroups, each owning 16 rows x 32 tokens (two 16x16 FP32 accumulators).
-// LDS: 10.5 KiB -> 6 WGs/CU! Skips 2nd 16-token tile whenever np <= 16 (>55% of experts at B=256).
+// 64x64x32 Scaled FP16->FP32 WMMA NVFP4 MoE GEMM (Wave64-native, matches avg cnt=64 at B=1024!):
+// WG: 64 x 4 = 256 threads = 4 Wave64 subgroups, each owning 16 rows x 64 tokens (four 16x16 FP32 accumulators).
+// LDS: 12.5 KiB -> 5 WGs/CU! Skips unused 16-token tiles when np <= 16/32/48.
 layout(local_size_x = 64, local_size_y = 4) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
@@ -25,10 +25,10 @@ layout(push_constant) uniform PC {
 
 shared float     s_e2m1[16];
 shared float16_t s_w[64 * 32];     // 4 KiB: [row 0..63][k 0..31]
-shared float16_t s_x[32 * 32];     // 2 KiB: [tok 0..31][k 0..31]
+shared float16_t s_x[64 * 32];     // 4 KiB: [tok 0..63][k 0..31]
 shared float     s_c[4][16 * 16];  // 4 KiB: epilogue scratch per subgroup
-shared uint      s_tok[32];
-shared uint      s_slot[32];
+shared uint      s_tok[64];
+shared uint      s_slot[64];
 
 float decode_e4m3_fast(uint code) {
     uint sign = (code & 0x80u) << 24;
@@ -73,15 +73,15 @@ void main() {
     uint w_row = lid >> 2; // 0..63
     uint w_q   = lid & 3u; // 0..3 -> 8 FP4 nibbles
     uint gr    = r_base + w_row;
-    uint xt    = lid >> 3; // 0..31
+    uint xt    = lid >> 3; // 0..31 (2 passes for 0..63)
     uint xk_v4 = lid & 7u; // 0..7 -> 4 F32s
 
-    const float X_SC = 0.0625; // 1/16 to guarantee zero FP16 overflow
+    const float X_SC = 0.0625;
     float X_UNSC = 16.0 * outer;
 
-    for (uint p0 = 0u; p0 < cnt; p0 += 32u) {
-        uint np = min(32u, cnt - p0);
-        if (lid < 32u) {
+    for (uint p0 = 0u; p0 < cnt; p0 += 64u) {
+        uint np = min(64u, cnt - p0);
+        if (lid < 64u) {
             if (lid < np) {
                 uint tk = pt.v[off + p0 + lid];
                 uint k  = pk.v[off + p0 + lid];
@@ -94,10 +94,10 @@ void main() {
         barrier();
 
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 = c0;
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 = c0, c2 = c0, c3 = c0;
 
         for (uint k0 = 0u; k0 < pc.cols; k0 += 32u) {
-            // Load & dequant W[64, 32] -> s_w[64 * 32] FP16 (all 256 threads active)
+            // Load & dequant W[64, 32] -> s_w FP16 (all 256 threads active)
             uint kb = w_q * 8u;
             uint sw_off = w_row * 32u + kb;
             if (gr < pc.rows) {
@@ -117,46 +117,47 @@ void main() {
             } else {
                 for (uint u = 0u; u < 8u; ++u) s_w[sw_off + u] = float16_t(0.0);
             }
-            // Load X[32, 32] -> s_x[32 * 32] FP16 (all 256 threads active, 128B coalesced bursts)
-            uint sx_off = xt * 32u + xk_v4 * 4u;
+            // Load X[64, 32] -> s_x FP16 in 2 coalesced 128B bursts
+            uint sx0 = xt * 32u + xk_v4 * 4u;
             if (xt < np) {
                 vec4 xv = xbuf.v[s_tok[xt] * xs + (k0 >> 2) + xk_v4] * X_SC;
-                s_x[sx_off + 0u] = float16_t(xv.x);
-                s_x[sx_off + 1u] = float16_t(xv.y);
-                s_x[sx_off + 2u] = float16_t(xv.z);
-                s_x[sx_off + 3u] = float16_t(xv.w);
+                s_x[sx0 + 0u] = float16_t(xv.x); s_x[sx0 + 1u] = float16_t(xv.y);
+                s_x[sx0 + 2u] = float16_t(xv.z); s_x[sx0 + 3u] = float16_t(xv.w);
             } else {
-                s_x[sx_off + 0u] = float16_t(0.0);
-                s_x[sx_off + 1u] = float16_t(0.0);
-                s_x[sx_off + 2u] = float16_t(0.0);
-                s_x[sx_off + 3u] = float16_t(0.0);
+                s_x[sx0 + 0u] = float16_t(0.0); s_x[sx0 + 1u] = float16_t(0.0);
+                s_x[sx0 + 2u] = float16_t(0.0); s_x[sx0 + 3u] = float16_t(0.0);
+            }
+            uint xt1 = xt + 32u;
+            uint sx1 = xt1 * 32u + xk_v4 * 4u;
+            if (xt1 < np) {
+                vec4 xv = xbuf.v[s_tok[xt1] * xs + (k0 >> 2) + xk_v4] * X_SC;
+                s_x[sx1 + 0u] = float16_t(xv.x); s_x[sx1 + 1u] = float16_t(xv.y);
+                s_x[sx1 + 2u] = float16_t(xv.z); s_x[sx1 + 3u] = float16_t(xv.w);
+            } else {
+                s_x[sx1 + 0u] = float16_t(0.0); s_x[sx1 + 1u] = float16_t(0.0);
+                s_x[sx1 + 2u] = float16_t(0.0); s_x[sx1 + 3u] = float16_t(0.0);
             }
             barrier();
 
-            // WMMA: 2 K-steps of 16, 1 or 2 N-tiles of 16
+            // WMMA: 2 K-steps of 16 x up to 4 N-tiles of 16
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
             uint a_base = sub * 16u * 32u;
 
             coopMatLoad(a, s_w, a_base + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b, s_x, 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor);
-            c0 = coopMatMulAdd(a, b, c0);
-            if (np > 16u) {
-                coopMatLoad(b, s_x, 16u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor);
-                c1 = coopMatMulAdd(a, b, c1);
-            }
+            coopMatLoad(b, s_x,  0u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c0 = coopMatMulAdd(a, b, c0);
+            if (np > 16u) { coopMatLoad(b, s_x, 16u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c1 = coopMatMulAdd(a, b, c1); }
+            if (np > 32u) { coopMatLoad(b, s_x, 32u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c2 = coopMatMulAdd(a, b, c2); }
+            if (np > 48u) { coopMatLoad(b, s_x, 48u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c3 = coopMatMulAdd(a, b, c3); }
 
             coopMatLoad(a, s_w, a_base + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b, s_x, 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor);
-            c0 = coopMatMulAdd(a, b, c0);
-            if (np > 16u) {
-                coopMatLoad(b, s_x, 16u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor);
-                c1 = coopMatMulAdd(a, b, c1);
-            }
+            coopMatLoad(b, s_x,  0u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c0 = coopMatMulAdd(a, b, c0);
+            if (np > 16u) { coopMatLoad(b, s_x, 16u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c1 = coopMatMulAdd(a, b, c1); }
+            if (np > 32u) { coopMatLoad(b, s_x, 32u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c2 = coopMatMulAdd(a, b, c2); }
+            if (np > 48u) { coopMatLoad(b, s_x, 48u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutColumnMajor); c3 = coopMatMulAdd(a, b, c3); }
             barrier();
         }
 
-        // Epilogue helper for a 16x16 tile starting at token offset t_off (0 or 16)
         F32Out ob = F32Out(pc.out_addr);
         uint sub_r0 = r_base + sub * 16u;
         #define WRITE_TILE(CM, T_OFF) { \
@@ -193,7 +194,9 @@ void main() {
             } \
             subgroupBarrier(); \
         }
-        WRITE_TILE(c0, 0u)
+        WRITE_TILE(c0,  0u)
         if (np > 16u) WRITE_TILE(c1, 16u)
+        if (np > 32u) WRITE_TILE(c2, 32u)
+        if (np > 48u) WRITE_TILE(c3, 48u)
     }
 }
