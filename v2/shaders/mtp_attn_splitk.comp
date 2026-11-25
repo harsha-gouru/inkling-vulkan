@@ -1,0 +1,84 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Split-K shared-KV attention for MTP Global layer (layer 1):
+// Grid: (N_HEADS=24, n_splits, 1), 64 threads
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t q_addr, kc_addr, vc_addr, kd_addr, vd_addr, part_ml_addr, part_o_addr;
+    uint ctx_len, bs, n_splits;
+} pc;
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint sp  = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint kvh = h / 3u;
+    uint d0 = tid, d1 = tid + 64u;
+
+    uint chunk = (pc.ctx_len + pc.n_splits - 1u) / pc.n_splits;
+    uint j_lo  = sp * chunk;
+    uint j_hi  = min(pc.ctx_len, j_lo + chunk);
+
+    F32In qb = F32In(pc.q_addr), kc = F32In(pc.kc_addr), vc = F32In(pc.vc_addr);
+    F32In kd = F32In(pc.kd_addr), vd = F32In(pc.vd_addr);
+
+    #define LD_MQ(T, QA, QB) \
+        float QA = (T < pc.bs) ? qb.v[T * 3072u + h * 128u + d0] : 0.0; \
+        float QB = (T < pc.bs) ? qb.v[T * 3072u + h * 128u + d1] : 0.0;
+    LD_MQ(0u, q0a, q0b) LD_MQ(1u, q1a, q1b) LD_MQ(2u, q2a, q2b) LD_MQ(3u, q3a, q3b)
+    LD_MQ(4u, q4a, q4b) LD_MQ(5u, q5a, q5b) LD_MQ(6u, q6a, q6b) LD_MQ(7u, q7a, q7b)
+
+    float m0=-1e30,l0=0.0,a0a=0.0,a0b=0.0;
+    float m1=-1e30,l1=0.0,a1a=0.0,a1b=0.0;
+    float m2=-1e30,l2=0.0,a2a=0.0,a2b=0.0;
+    float m3=-1e30,l3=0.0,a3a=0.0,a3b=0.0;
+    float m4=-1e30,l4=0.0,a4a=0.0,a4b=0.0;
+    float m5=-1e30,l5=0.0,a5a=0.0,a5b=0.0;
+    float m6=-1e30,l6=0.0,a6a=0.0,a6b=0.0;
+    float m7=-1e30,l7=0.0,a7a=0.0,a7b=0.0;
+    const float sc = inversesqrt(128.0);
+
+    #define MSTEP(T, QA, QB, M, L, AA, AB) \
+        if (T < pc.bs) { \
+            float s = subgroupAdd(QA * k0 + QB * k1) * sc; \
+            float mn = max(M, s); float al = (L > 0.0) ? exp(M - mn) : 0.0; float p = exp(s - mn); \
+            L = L * al + p; AA = AA * al + p * v0; AB = AB * al + p * v1; M = mn; \
+        }
+
+    for (uint j = j_lo; j < j_hi; ++j) {
+        uint b = j * 1024u + kvh * 128u;
+        float k0 = kc.v[b + d0], k1 = kc.v[b + d1];
+        float v0 = vc.v[b + d0], v1 = vc.v[b + d1];
+        MSTEP(0u, q0a, q0b, m0, l0, a0a, a0b) MSTEP(1u, q1a, q1b, m1, l1, a1a, a1b)
+        MSTEP(2u, q2a, q2b, m2, l2, a2a, a2b) MSTEP(3u, q3a, q3b, m3, l3, a3a, a3b)
+        MSTEP(4u, q4a, q4b, m4, l4, a4a, a4b) MSTEP(5u, q5a, q5b, m5, l5, a5a, a5b)
+        MSTEP(6u, q6a, q6b, m6, l6, a6a, a6b) MSTEP(7u, q7a, q7b, m7, l7, a7a, a7b)
+    }
+    if (sp == 0u) {
+        for (uint j = 0u; j < pc.bs; ++j) {
+            uint b = j * 1024u + kvh * 128u;
+            float k0 = kd.v[b + d0], k1 = kd.v[b + d1];
+            float v0 = vd.v[b + d0], v1 = vd.v[b + d1];
+            MSTEP(0u, q0a, q0b, m0, l0, a0a, a0b) MSTEP(1u, q1a, q1b, m1, l1, a1a, a1b)
+            MSTEP(2u, q2a, q2b, m2, l2, a2a, a2b) MSTEP(3u, q3a, q3b, m3, l3, a3a, a3b)
+            MSTEP(4u, q4a, q4b, m4, l4, a4a, a4b) MSTEP(5u, q5a, q5b, m5, l5, a5a, a5b)
+            MSTEP(6u, q6a, q6b, m6, l6, a6a, a6b) MSTEP(7u, q7a, q7b, m7, l7, a7a, a7b)
+        }
+    }
+
+    F32Out pml = F32Out(pc.part_ml_addr), po = F32Out(pc.part_o_addr);
+    #define MST(T, M, L, AA, AB) \
+        if (T < pc.bs) { \
+            uint idx = (T * 24u + h) * pc.n_splits + sp; \
+            if (tid == 0u) { pml.v[idx * 2u] = M; pml.v[idx * 2u + 1u] = L; } \
+            po.v[idx * 128u + d0] = AA; po.v[idx * 128u + d1] = AB; \
+        }
+    MST(0u, m0, l0, a0a, a0b) MST(1u, m1, l1, a1a, a1b) MST(2u, m2, l2, a2a, a2b) MST(3u, m3, l3, a3a, a3b)
+    MST(4u, m4, l4, a4a, a4b) MST(5u, m5, l5, a5a, a5b) MST(6u, m6, l6, a6a, a6b) MST(7u, m7, l7, a7a, a7b)
+}

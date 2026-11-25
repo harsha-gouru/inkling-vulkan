@@ -1,0 +1,131 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer U32In   { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In   { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t s_addr;
+    uint64_t ids_addr;
+    uint64_t topw_addr;
+    uint64_t x_addr;
+    uint64_t out_addr;
+    uint rows;
+    uint cols;
+    uint mode;
+} pc;
+
+shared float s_e4m3[256];
+shared uint  s_ids[8];
+shared float s_topw[8];
+
+float decode_e4m3_fast(uint code) {
+    uint sign = (code & 0x80u) << 24;
+    uint exp  = (code & 0x7Fu) >> 3;
+    uint man  = code & 7u;
+    if (exp != 0u) return uintBitsToFloat(sign | ((exp + 120u) << 23) | (man << 20));
+    float v = float(man) * (1.0 / 512.0);
+    return ((code & 0x80u) != 0u) ? -v : v;
+}
+
+float decode_ue8m0_fast(uint code) {
+    return (code == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(code << 23);
+}
+
+#define D4(WORD, X) dot(vec4(s_e4m3[(WORD)&255u], s_e4m3[((WORD)>>8u)&255u], s_e4m3[((WORD)>>16u)&255u], s_e4m3[((WORD)>>24u)&255u]), X)
+
+void main() {
+    uint lid = gl_LocalInvocationID.y * 64u + gl_LocalInvocationID.x;
+    s_e4m3[lid] = decode_e4m3_fast(lid);
+    if (lid < 8u) {
+        s_ids[lid] = U32In(pc.ids_addr).v[lid];
+        if (pc.mode == 1u) s_topw[lid] = F32In(pc.topw_addr).v[lid];
+    }
+    barrier();
+
+    uint tid = gl_LocalInvocationID.x;
+    uint sub = gl_LocalInvocationID.y;
+    uint scale_cols = pc.cols >> 5;
+
+    if (pc.mode == 0u) {
+        uint pair_idx = gl_WorkGroupID.x * 4u + sub;
+        uint half_rows = pc.rows >> 1;
+        if (pair_idx >= half_rows) return;
+        uint k = gl_WorkGroupID.y;
+        uint e = s_ids[k];
+        uint r0 = 2u * pair_idx;
+        uint64_t row_w_stride = uint64_t(pc.cols);
+        uint64_t row_s_stride = uint64_t(scale_cols);
+        uint64_t w0_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r0)) * row_w_stride;
+        uint64_t s0_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r0)) * row_s_stride;
+        uint64_t s1_bytes = s0_bytes + row_s_stride;
+
+        UVec4In wb0 = UVec4In(pc.w_addr + w0_bytes);
+        UVec4In wb1 = UVec4In(pc.w_addr + w0_bytes + row_w_stride);
+        U32In   sb0 = U32In(pc.s_addr + (s0_bytes & ~3ul));
+        U32In   sb1 = U32In(pc.s_addr + (s1_bytes & ~3ul));
+        uint so0 = uint(s0_bytes & 3ul);
+        uint so1 = uint(s1_bytes & 3ul);
+        Vec4In xbuf = Vec4In(pc.x_addr);
+
+        float acc_g = 0.0, acc_u = 0.0;
+        for (uint b = tid; b < scale_cols; b += 64u) {
+            uint xb = b * 8u;
+            vec4 x0 = xbuf.v[xb+0u], x1 = xbuf.v[xb+1u], x2 = xbuf.v[xb+2u], x3 = xbuf.v[xb+3u];
+            vec4 x4 = xbuf.v[xb+4u], x5 = xbuf.v[xb+5u], x6 = xbuf.v[xb+6u], x7 = xbuf.v[xb+7u];
+
+            uvec4 g0 = wb0.v[2u*b], g1 = wb0.v[2u*b+1u];
+            uint i0 = b + so0;
+            uint sc0 = (sb0.v[i0 >> 2] >> ((i0 & 3u) * 8u)) & 0xFFu;
+            acc_g += (D4(g0.x, x0) + D4(g0.y, x1) + D4(g0.z, x2) + D4(g0.w, x3)
+                    + D4(g1.x, x4) + D4(g1.y, x5) + D4(g1.z, x6) + D4(g1.w, x7)) * decode_ue8m0_fast(sc0);
+
+            uvec4 u0 = wb1.v[2u*b], u1 = wb1.v[2u*b+1u];
+            uint i1 = b + so1;
+            uint sc1 = (sb1.v[i1 >> 2] >> ((i1 & 3u) * 8u)) & 0xFFu;
+            acc_u += (D4(u0.x, x0) + D4(u0.y, x1) + D4(u0.z, x2) + D4(u0.w, x3)
+                    + D4(u1.x, x4) + D4(u1.y, x5) + D4(u1.z, x6) + D4(u1.w, x7)) * decode_ue8m0_fast(sc1);
+        }
+        float g = subgroupAdd(acc_g);
+        float u = subgroupAdd(acc_u);
+        if (tid == 0u) {
+            float act = (4.0 * tanh(g * 0.25)) / (1.0 + exp(-g));
+            float up  = 25.0 * tanh(u * 0.04);
+            F32Out(pc.out_addr).v[k * half_rows + pair_idx] = act * up;
+        }
+    } else {
+        uint r = gl_WorkGroupID.x * 4u + sub;
+        if (r >= pc.rows) return;
+        float total = 0.0;
+        for (uint k = 0u; k < 8u; ++k) {
+            uint e = s_ids[k];
+            uint64_t w_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r)) * uint64_t(pc.cols);
+            uint64_t s_bytes = (uint64_t(e) * uint64_t(pc.rows) + uint64_t(r)) * uint64_t(scale_cols);
+            UVec4In wb = UVec4In(pc.w_addr + w_bytes);
+            U32In   sb = U32In(pc.s_addr + (s_bytes & ~3ul));
+            uint so = uint(s_bytes & 3ul);
+            Vec4In xbuf = Vec4In(pc.x_addr + uint64_t(k) * uint64_t(pc.cols) * 4ul);
+
+            float acc = 0.0;
+            for (uint b = tid; b < scale_cols; b += 64u) {
+                uint xb = b * 8u;
+                uvec4 w0 = wb.v[2u*b], w1 = wb.v[2u*b+1u];
+                uint idx = b + so;
+                uint sc = (sb.v[idx >> 2] >> ((idx & 3u) * 8u)) & 0xFFu;
+                acc += (D4(w0.x, xbuf.v[xb+0u]) + D4(w0.y, xbuf.v[xb+1u])
+                      + D4(w0.z, xbuf.v[xb+2u]) + D4(w0.w, xbuf.v[xb+3u])
+                      + D4(w1.x, xbuf.v[xb+4u]) + D4(w1.y, xbuf.v[xb+5u])
+                      + D4(w1.z, xbuf.v[xb+6u]) + D4(w1.w, xbuf.v[xb+7u])) * decode_ue8m0_fast(sc);
+            }
+            total += s_topw[k] * subgroupAdd(acc);
+        }
+        if (tid == 0u) F32Out(pc.out_addr).v[r] = total;
+    }
+}

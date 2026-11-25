@@ -1,0 +1,76 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32In  { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)           buffer F32RW  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t x_addr;          // [B, C]
+    uint64_t hist_addr;       // [3, C]
+    uint64_t w_addr;          // BF16: [C, 4] or [4, C]
+    uint64_t dyn_addr;        // 0 or F32 [B, 32]
+    uint64_t out_addr;        // [B, C]
+    uint64_t hist_steps_addr; // 0 or F32 [B, 3, C] (snapshot after each step t for spec rollback)
+    uint C;
+    uint B;
+    uint w_is_reversed_lag;
+} pc;
+
+float read_bf16(U32In buf, uint idx) {
+    uint p = buf.v[idx >> 1];
+    uint bits = ((idx & 1u) == 0u) ? ((p & 0xFFFFu) << 16) : (p & 0xFFFF0000u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.C) return;
+
+    F32In  xb = F32In(pc.x_addr);
+    F32RW  hb = F32RW(pc.hist_addr);
+    U32In  wb = U32In(pc.w_addr);
+    F32Out ob = F32Out(pc.out_addr);
+
+    float h0 = hb.v[0u * pc.C + c];
+    float h1 = hb.v[1u * pc.C + c];
+    float h2 = hb.v[2u * pc.C + c];
+
+    float w0, w1, w2, w3;
+    if (pc.w_is_reversed_lag == 0u) {
+        uint base = c * 4u;
+        w0 = read_bf16(wb, base + 0u); w1 = read_bf16(wb, base + 1u);
+        w2 = read_bf16(wb, base + 2u); w3 = read_bf16(wb, base + 3u);
+    } else {
+        w3 = read_bf16(wb, 0u * pc.C + c); w2 = read_bf16(wb, 1u * pc.C + c);
+        w1 = read_bf16(wb, 2u * pc.C + c); w0 = read_bf16(wb, 3u * pc.C + c);
+    }
+    float scale = (pc.dyn_addr != 0ul) ? (1.0 / 3.0) : inversesqrt(5.0);
+    uint head = c >> 7;
+
+    for (uint t = 0u; t < pc.B; ++t) {
+        float x0 = xb.v[t * pc.C + c];
+        float y = w0 * h0 + w1 * h1 + w2 * h2 + w3 * x0;
+        if (pc.dyn_addr != 0ul) {
+            F32In db = F32In(pc.dyn_addr);
+            uint dbase = t * 32u + head * 4u;
+            y += db.v[dbase + 0u] * x0 + db.v[dbase + 1u] * h2 + db.v[dbase + 2u] * h1 + db.v[dbase + 3u] * h0;
+        }
+        ob.v[t * pc.C + c] = (x0 + y) * scale;
+        h0 = h1; h1 = h2; h2 = x0;
+        if (pc.hist_steps_addr != 0ul) {
+            F32Out hs = F32Out(pc.hist_steps_addr);
+            uint sbase = t * 3u * pc.C;
+            hs.v[sbase + 0u * pc.C + c] = h0;
+            hs.v[sbase + 1u * pc.C + c] = h1;
+            hs.v[sbase + 2u * pc.C + c] = h2;
+        }
+    }
+
+    hb.v[0u * pc.C + c] = h0;
+    hb.v[1u * pc.C + c] = h1;
+    hb.v[2u * pc.C + c] = h2;
+}

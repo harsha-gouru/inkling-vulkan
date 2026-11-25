@@ -1,0 +1,76 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t x_addr;
+    uint64_t y_addr;
+    uint rows;
+    uint cols;
+    uint B;
+} pc;
+
+vec2 unpack_bf16x2(uint packed) {
+    return vec2(uintBitsToFloat((packed & 0xFFFFu) << 16), uintBitsToFloat(packed & 0xFFFF0000u));
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    if (r >= pc.rows) return;
+    uint t0 = gl_WorkGroupID.y * 8u;
+    uint nt = min(8u, pc.B - t0);
+    uint tid = gl_LocalInvocationID.x;
+    uint n_v8 = pc.cols >> 3;
+    uint xs = pc.cols >> 2;
+
+    UVec4In wbuf = UVec4In(pc.w_addr + uint64_t(r) * uint64_t(pc.cols) * 2ul);
+    Vec4In  xbuf = Vec4In(pc.x_addr + uint64_t(t0) * uint64_t(pc.cols) * 4ul);
+
+    float a0=0.0, a1=0.0, a2=0.0, a3=0.0, a4=0.0, a5=0.0, a6=0.0, a7=0.0;
+    if (nt == 8u) {
+        for (uint i = tid; i < n_v8; i += 64u) {
+            uvec4 w = wbuf.v[i];
+            vec4 wa = vec4(unpack_bf16x2(w.x), unpack_bf16x2(w.y));
+            vec4 wb = vec4(unpack_bf16x2(w.z), unpack_bf16x2(w.w));
+            uint b = 2u * i;
+            a0 += dot(wa, xbuf.v[b       ]) + dot(wb, xbuf.v[b + 1u       ]);
+            a1 += dot(wa, xbuf.v[b +   xs]) + dot(wb, xbuf.v[b + 1u +   xs]);
+            a2 += dot(wa, xbuf.v[b + 2*xs]) + dot(wb, xbuf.v[b + 1u + 2*xs]);
+            a3 += dot(wa, xbuf.v[b + 3*xs]) + dot(wb, xbuf.v[b + 1u + 3*xs]);
+            a4 += dot(wa, xbuf.v[b + 4*xs]) + dot(wb, xbuf.v[b + 1u + 4*xs]);
+            a5 += dot(wa, xbuf.v[b + 5*xs]) + dot(wb, xbuf.v[b + 1u + 5*xs]);
+            a6 += dot(wa, xbuf.v[b + 6*xs]) + dot(wb, xbuf.v[b + 1u + 6*xs]);
+            a7 += dot(wa, xbuf.v[b + 7*xs]) + dot(wb, xbuf.v[b + 1u + 7*xs]);
+        }
+    } else {
+        for (uint i = tid; i < n_v8; i += 64u) {
+            uvec4 w = wbuf.v[i];
+            vec4 wa = vec4(unpack_bf16x2(w.x), unpack_bf16x2(w.y));
+            vec4 wb = vec4(unpack_bf16x2(w.z), unpack_bf16x2(w.w));
+            uint b = 2u * i;
+            a0 += dot(wa, xbuf.v[b]) + dot(wb, xbuf.v[b + 1u]);
+            if (nt > 1u) a1 += dot(wa, xbuf.v[b +   xs]) + dot(wb, xbuf.v[b + 1u +   xs]);
+            if (nt > 2u) a2 += dot(wa, xbuf.v[b + 2*xs]) + dot(wb, xbuf.v[b + 1u + 2*xs]);
+            if (nt > 3u) a3 += dot(wa, xbuf.v[b + 3*xs]) + dot(wb, xbuf.v[b + 1u + 3*xs]);
+            if (nt > 4u) a4 += dot(wa, xbuf.v[b + 4*xs]) + dot(wb, xbuf.v[b + 1u + 4*xs]);
+            if (nt > 5u) a5 += dot(wa, xbuf.v[b + 5*xs]) + dot(wb, xbuf.v[b + 1u + 5*xs]);
+            if (nt > 6u) a6 += dot(wa, xbuf.v[b + 6*xs]) + dot(wb, xbuf.v[b + 1u + 6*xs]);
+        }
+    }
+    F32Out ybuf = F32Out(pc.y_addr);
+    float s0 = subgroupAdd(a0); if (tid == 0u) ybuf.v[(t0 + 0u) * pc.rows + r] = s0;
+    if (nt > 1u) { float s = subgroupAdd(a1); if (tid == 0u) ybuf.v[(t0 + 1u) * pc.rows + r] = s; }
+    if (nt > 2u) { float s = subgroupAdd(a2); if (tid == 0u) ybuf.v[(t0 + 2u) * pc.rows + r] = s; }
+    if (nt > 3u) { float s = subgroupAdd(a3); if (tid == 0u) ybuf.v[(t0 + 3u) * pc.rows + r] = s; }
+    if (nt > 4u) { float s = subgroupAdd(a4); if (tid == 0u) ybuf.v[(t0 + 4u) * pc.rows + r] = s; }
+    if (nt > 5u) { float s = subgroupAdd(a5); if (tid == 0u) ybuf.v[(t0 + 5u) * pc.rows + r] = s; }
+    if (nt > 6u) { float s = subgroupAdd(a6); if (tid == 0u) ybuf.v[(t0 + 6u) * pc.rows + r] = s; }
+    if (nt > 7u) { float s = subgroupAdd(a7); if (tid == 0u) ybuf.v[(t0 + 7u) * pc.rows + r] = s; }
+}

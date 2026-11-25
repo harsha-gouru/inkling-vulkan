@@ -1,0 +1,28 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Grid: ((dim+63)/64, B, 1)
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t y_exps_addr;  // [B, 8, dim]
+    uint64_t weights_addr; // [B, 8]
+    uint64_t out_addr;     // [B, dim]
+    uint dim;
+} pc;
+
+void main() {
+    uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    uint t = gl_WorkGroupID.y;
+    if (i >= pc.dim) return;
+    F32In ye = F32In(pc.y_exps_addr);
+    F32In wb = F32In(pc.weights_addr);
+    float acc = 0.0;
+    for (uint k = 0u; k < 8u; ++k) {
+        acc += wb.v[t * 8u + k] * ye.v[(t * 8u + k) * pc.dim + i];
+    }
+    F32Out(pc.out_addr).v[t * pc.dim + i] = acc;
+}

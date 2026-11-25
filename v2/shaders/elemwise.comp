@@ -1,0 +1,48 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32In  { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t a_addr;
+    uint64_t b_addr;
+    uint64_t c_addr;
+    uint64_t d_addr;
+    uint n;
+    uint mode; // 0: c=a+b, 1: c=a*sig(b), 2: loop_ctrl, 3: situ, 4: c=a, 5: c=silu(a)*b, 6: c[i]=bf16(a[i%2304]), 7: c[i]=0
+} pc;
+
+float read_bf16(U32In buf, uint idx) {
+    uint p = buf.v[idx >> 1];
+    uint bits = ((idx & 1u) == 0u) ? ((p & 0xFFFFu) << 16) : (p & 0xFFFF0000u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    F32Out C = F32Out(pc.c_addr);
+    if (pc.mode == 0u) {
+        C.v[i] = F32In(pc.a_addr).v[i] + F32In(pc.b_addr).v[i];
+    } else if (pc.mode == 1u) {
+        C.v[i] = F32In(pc.a_addr).v[i] / (1.0 + exp(-F32In(pc.b_addr).v[i]));
+    } else if (pc.mode == 3u) {
+        float g = F32In(pc.a_addr).v[i];
+        float u = F32In(pc.b_addr).v[i];
+        C.v[i] = ((4.0 * tanh(g * 0.25)) / (1.0 + exp(-g))) * (25.0 * tanh(u * 0.04));
+    } else if (pc.mode == 4u) {
+        C.v[i] = F32In(pc.a_addr).v[i];
+    } else if (pc.mode == 5u) {
+        float g = F32In(pc.a_addr).v[i];
+        float u = F32In(pc.b_addr).v[i];
+        C.v[i] = (g / (1.0 + exp(-g))) * u;
+    } else if (pc.mode == 6u) {
+        C.v[i] = read_bf16(U32In(pc.a_addr), i % 2304u);
+    } else if (pc.mode == 7u) {
+        C.v[i] = 0.0;
+    }
+}

@@ -1,0 +1,97 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Split-K shared-KV attention for B <= 8 Global layers:
+// Grid: (N_HEADS=24, n_splits, 1), 64 threads (1 Wave64)
+// Reads each KV token j ONCE and updates all B (<= 8) queries in registers!
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32In  { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t q_addr, r_addr, rel_proj_addr, k_cache_addr, v_cache_addr, part_ml_addr, part_o_addr;
+    uint pos_start, B, n_splits, total_kv;
+} pc;
+
+float read_bf16(U32In buf, uint idx) {
+    uint p = buf.v[idx >> 1];
+    uint bits = ((idx & 1u) == 0u) ? ((p & 0xFFFFu) << 16) : (p & 0xFFFF0000u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint sp  = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint kvh = h / 3u;
+    uint d0 = tid, d1 = tid + 64u;
+
+    uint chunk = (pc.total_kv + pc.n_splits - 1u) / pc.n_splits;
+    uint j_lo  = sp * chunk;
+    uint j_hi  = min(pc.total_kv, j_lo + chunk);
+
+    F32In qb = F32In(pc.q_addr), rb = F32In(pc.r_addr);
+    U32In rp = U32In(pc.rel_proj_addr);
+    F32In kc = F32In(pc.k_cache_addr), vc = F32In(pc.v_cache_addr);
+
+    #define LD_Q(T, QA, QB, R) \
+        float QA = (T < pc.B) ? qb.v[T * 3072u + h * 128u + d0] : 0.0; \
+        float QB = (T < pc.B) ? qb.v[T * 3072u + h * 128u + d1] : 0.0; \
+        float R  = (T < pc.B && tid < 16u) ? rb.v[T * 384u + h * 16u + tid] : 0.0;
+
+    LD_Q(0u, q0a, q0b, r0) LD_Q(1u, q1a, q1b, r1) LD_Q(2u, q2a, q2b, r2) LD_Q(3u, q3a, q3b, r3)
+    LD_Q(4u, q4a, q4b, r4) LD_Q(5u, q5a, q5b, r5) LD_Q(6u, q6a, q6b, r6) LD_Q(7u, q7a, q7b, r7)
+
+    float m0=-1e30,l0=0.0,a0a=0.0,a0b=0.0;
+    float m1=-1e30,l1=0.0,a1a=0.0,a1b=0.0;
+    float m2=-1e30,l2=0.0,a2a=0.0,a2b=0.0;
+    float m3=-1e30,l3=0.0,a3a=0.0,a3b=0.0;
+    float m4=-1e30,l4=0.0,a4a=0.0,a4b=0.0;
+    float m5=-1e30,l5=0.0,a5a=0.0,a5b=0.0;
+    float m6=-1e30,l6=0.0,a6a=0.0,a6b=0.0;
+    float m7=-1e30,l7=0.0,a7a=0.0,a7b=0.0;
+
+    const float sc = inversesqrt(128.0);
+    bool far_split = (j_hi == 0u) || (pc.pos_start >= (j_hi - 1u) + 1024u);
+
+    #define STEP_T(T, QA, QB, R, M, L, AA, AB) \
+        if (T < pc.B && j <= pc.pos_start + T) { \
+            float dot = subgroupAdd(QA * k0 + QB * k1); \
+            float rb_v = 0.0; \
+            if (!far_split) { \
+                uint dist = (pc.pos_start + T) - j; \
+                if (dist < 1024u) rb_v = subgroupAdd((tid < 16u) ? (R * read_bf16(rp, dist * 16u + tid)) : 0.0); \
+            } \
+            float s = dot * sc + rb_v; \
+            float mn = max(M, s); float al = (L > 0.0) ? exp(M - mn) : 0.0; float p = exp(s - mn); \
+            L = L * al + p; AA = AA * al + p * v0; AB = AB * al + p * v1; M = mn; \
+        }
+
+    for (uint j = j_lo; j < j_hi; ++j) {
+        uint kv_base = j * 1024u + kvh * 128u;
+        float k0 = kc.v[kv_base + d0], k1 = kc.v[kv_base + d1];
+        float v0 = vc.v[kv_base + d0], v1 = vc.v[kv_base + d1];
+        STEP_T(0u, q0a, q0b, r0, m0, l0, a0a, a0b)
+        STEP_T(1u, q1a, q1b, r1, m1, l1, a1a, a1b)
+        STEP_T(2u, q2a, q2b, r2, m2, l2, a2a, a2b)
+        STEP_T(3u, q3a, q3b, r3, m3, l3, a3a, a3b)
+        STEP_T(4u, q4a, q4b, r4, m4, l4, a4a, a4b)
+        STEP_T(5u, q5a, q5b, r5, m5, l5, a5a, a5b)
+        STEP_T(6u, q6a, q6b, r6, m6, l6, a6a, a6b)
+        STEP_T(7u, q7a, q7b, r7, m7, l7, a7a, a7b)
+    }
+
+    F32Out pml = F32Out(pc.part_ml_addr);
+    F32Out po  = F32Out(pc.part_o_addr);
+    #define ST_T(T, M, L, AA, AB) \
+        if (T < pc.B) { \
+            uint idx = (T * 24u + h) * pc.n_splits + sp; \
+            if (tid == 0u) { pml.v[idx * 2u] = M; pml.v[idx * 2u + 1u] = L; } \
+            po.v[idx * 128u + d0] = AA; po.v[idx * 128u + d1] = AB; \
+        }
+    ST_T(0u, m0, l0, a0a, a0b) ST_T(1u, m1, l1, a1a, a1b) ST_T(2u, m2, l2, a2a, a2b) ST_T(3u, m3, l3, a3a, a3b)
+    ST_T(4u, m4, l4, a4a, a4b) ST_T(5u, m5, l5, a5a, a5b) ST_T(6u, m6, l6, a6a, a6b) ST_T(7u, m7, l7, a7a, a7b)
+}

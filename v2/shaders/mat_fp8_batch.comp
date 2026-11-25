@@ -1,0 +1,88 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In   { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t s_addr;
+    uint64_t x_addr;
+    uint64_t y_addr;
+    uint rows;
+    uint cols;
+    uint B;
+} pc;
+
+shared float s_lut[256];
+
+float decode_e4m3(uint code) {
+    uint sign = (code & 0x80u) << 24;
+    uint exp  = (code & 0x7Fu) >> 3;
+    uint man  = code & 7u;
+    if (exp != 0u) return uintBitsToFloat(sign | ((exp + 120u) << 23) | (man << 20));
+    float v = float(man) * (1.0 / 512.0);
+    return ((code & 0x80u) != 0u) ? -v : v;
+}
+
+vec4 unpack4(uint p) {
+    return vec4(s_lut[p & 255u], s_lut[(p >> 8) & 255u], s_lut[(p >> 16) & 255u], s_lut[(p >> 24) & 255u]);
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.y * 64u + gl_LocalInvocationID.x;
+    s_lut[lid] = decode_e4m3(lid);
+    barrier();
+
+    uint r = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    if (r >= pc.rows) return;
+    uint t0 = gl_WorkGroupID.y * 8u;
+    uint nt = min(8u, pc.B - t0);
+    uint tid = gl_LocalInvocationID.x;
+    uint n_v16 = pc.cols >> 4;
+    uint xs = pc.cols >> 2;
+
+    UVec4In wbuf = UVec4In(pc.w_addr + uint64_t(r) * uint64_t(pc.cols));
+    Vec4In  xbuf = Vec4In(pc.x_addr + uint64_t(t0) * uint64_t(pc.cols) * 4ul);
+
+    float a0=0.0, a1=0.0, a2=0.0, a3=0.0, a4=0.0, a5=0.0, a6=0.0, a7=0.0;
+    if (nt == 8u) {
+        for (uint i = tid; i < n_v16; i += 64u) {
+            uvec4 w = wbuf.v[i];
+            vec4 w0 = unpack4(w.x), w1 = unpack4(w.y), w2 = unpack4(w.z), w3 = unpack4(w.w);
+            uint b = i << 2;
+            #define ACC(A, OFF) A += dot(w0, xbuf.v[b+OFF]) + dot(w1, xbuf.v[b+1u+OFF]) + dot(w2, xbuf.v[b+2u+OFF]) + dot(w3, xbuf.v[b+3u+OFF]);
+            ACC(a0, 0u) ACC(a1, xs) ACC(a2, 2u*xs) ACC(a3, 3u*xs)
+            ACC(a4, 4u*xs) ACC(a5, 5u*xs) ACC(a6, 6u*xs) ACC(a7, 7u*xs)
+        }
+    } else {
+        for (uint i = tid; i < n_v16; i += 64u) {
+            uvec4 w = wbuf.v[i];
+            vec4 w0 = unpack4(w.x), w1 = unpack4(w.y), w2 = unpack4(w.z), w3 = unpack4(w.w);
+            uint b = i << 2;
+            #define ACC2(A, OFF) A += dot(w0, xbuf.v[b+OFF]) + dot(w1, xbuf.v[b+1u+OFF]) + dot(w2, xbuf.v[b+2u+OFF]) + dot(w3, xbuf.v[b+3u+OFF]);
+            ACC2(a0, 0u)
+            if (nt > 1u) { ACC2(a1, xs) }
+            if (nt > 2u) { ACC2(a2, 2u*xs) }
+            if (nt > 3u) { ACC2(a3, 3u*xs) }
+            if (nt > 4u) { ACC2(a4, 4u*xs) }
+            if (nt > 5u) { ACC2(a5, 5u*xs) }
+            if (nt > 6u) { ACC2(a6, 6u*xs) }
+        }
+    }
+    float sc = F32In(pc.s_addr).v[r];
+    F32Out ybuf = F32Out(pc.y_addr);
+    float s0 = subgroupAdd(a0) * sc; if (tid == 0u) ybuf.v[(t0 + 0u) * pc.rows + r] = s0;
+    if (nt > 1u) { float s = subgroupAdd(a1) * sc; if (tid == 0u) ybuf.v[(t0 + 1u) * pc.rows + r] = s; }
+    if (nt > 2u) { float s = subgroupAdd(a2) * sc; if (tid == 0u) ybuf.v[(t0 + 2u) * pc.rows + r] = s; }
+    if (nt > 3u) { float s = subgroupAdd(a3) * sc; if (tid == 0u) ybuf.v[(t0 + 3u) * pc.rows + r] = s; }
+    if (nt > 4u) { float s = subgroupAdd(a4) * sc; if (tid == 0u) ybuf.v[(t0 + 4u) * pc.rows + r] = s; }
+    if (nt > 5u) { float s = subgroupAdd(a5) * sc; if (tid == 0u) ybuf.v[(t0 + 5u) * pc.rows + r] = s; }
+    if (nt > 6u) { float s = subgroupAdd(a6) * sc; if (tid == 0u) ybuf.v[(t0 + 6u) * pc.rows + r] = s; }
+    if (nt > 7u) { float s = subgroupAdd(a7) * sc; if (tid == 0u) ybuf.v[(t0 + 7u) * pc.rows + r] = s; }
+}

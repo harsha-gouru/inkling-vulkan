@@ -1,0 +1,24 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer InBuf  { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer OutBuf { uint v[]; };
+layout(push_constant) uniform PC {
+    uint64_t in_addr;
+    uint64_t out_addr;
+    uint n_vec4;
+} pc;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    InBuf inp = InBuf(pc.in_addr);
+    uvec4 acc = uvec4(0u);
+    for (uint i = gid; i < pc.n_vec4; i += stride) {
+        acc ^= inp.v[i];
+    }
+    if (gid < 256u) {
+        OutBuf outp = OutBuf(pc.out_addr);
+        outp.v[gid] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+    }
+}

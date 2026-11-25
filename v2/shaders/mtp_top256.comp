@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Grid: (n_draft, 1, 1), 256 threads — each thread keeps top-4 of its strided slice -> 1024 candidates!
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U32Out { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t logits_addr;
+    uint64_t out_ids;     // [n_draft, 1024]
+    uint64_t out_vals;    // [n_draft, 1024]
+    uint vocab;
+} pc;
+
+void main() {
+    uint t   = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    F32In lb = F32In(pc.logits_addr + uint64_t(t) * uint64_t(pc.vocab) * 4ul);
+
+    float v0 = -1e30, v1 = -1e30, v2 = -1e30, v3 = -1e30;
+    uint  i0 = 0u,    i1 = 0u,    i2 = 0u,    i3 = 0u;
+    for (uint i = tid; i < pc.vocab; i += 256u) {
+        float v = lb.v[i];
+        if (v > v3) {
+            if (v > v0) { v3=v2; i3=i2; v2=v1; i2=i1; v1=v0; i1=i0; v0=v; i0=i; }
+            else if (v > v1) { v3=v2; i3=i2; v2=v1; i2=i1; v1=v; i1=i; }
+            else if (v > v2) { v3=v2; i3=i2; v2=v; i2=i; }
+            else { v3=v; i3=i; }
+        }
+    }
+    uint base = t * 1024u + tid * 4u;
+    U32Out oi = U32Out(pc.out_ids);
+    F32Out ov = F32Out(pc.out_vals);
+    oi.v[base+0u]=i0; oi.v[base+1u]=i1; oi.v[base+2u]=i2; oi.v[base+3u]=i3;
+    ov.v[base+0u]=v0; ov.v[base+1u]=v1; ov.v[base+2u]=v2; ov.v[base+3u]=v3;
+}

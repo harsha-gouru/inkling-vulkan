@@ -1,0 +1,43 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Grid: (N_HEADS=24, BS, 1), 64 threads
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t part_ml_addr, part_o_addr, out_addr;
+    uint n_splits;
+} pc;
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint t   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint d0 = tid, d1 = tid + 64u;
+
+    F32In pml = F32In(pc.part_ml_addr), po = F32In(pc.part_o_addr);
+    uint base_idx = (t * 24u + h) * pc.n_splits;
+
+    float m = -1e30, l = 0.0, a0 = 0.0, a1 = 0.0;
+    for (uint sp = 0u; sp < pc.n_splits; ++sp) {
+        uint idx = base_idx + sp;
+        float lsp = pml.v[idx * 2u + 1u];
+        if (lsp <= 0.0) continue;
+        float msp = pml.v[idx * 2u];
+        float mn = max(m, msp);
+        float w_old = (l > 0.0) ? exp(m - mn) : 0.0;
+        float w_sp  = exp(msp - mn);
+        l  = l * w_old + lsp * w_sp;
+        a0 = a0 * w_old + po.v[idx * 128u + d0] * w_sp;
+        a1 = a1 * w_old + po.v[idx * 128u + d1] * w_sp;
+        m  = mn;
+    }
+
+    float inv_l = 1.0 / l;
+    F32Out ob = F32Out(pc.out_addr + uint64_t(t) * 3072ul * 4ul);
+    ob.v[h * 128u + d0] = a0 * inv_l;
+    ob.v[h * 128u + d1] = a1 * inv_l;
+}

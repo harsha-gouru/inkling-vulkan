@@ -1,0 +1,82 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Fused 6-or-8 FP8 E4M3 attention projections in 1 dispatch for B=1 decode (cols = 2304, PC = 124 B)
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer UVec4In { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer Vec4In  { vec4  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer F32In   { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer F32Out  { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t s_base;     // scratch base
+    uint64_t fp8_base;   // single FP8 slab base (weights + scales < 4 GiB!)
+    uint w_off0, w_off1, w_off2, w_off3, w_off4, w_off5, w_off6, w_off7;
+    uint sc_off0, sc_off1, sc_off2, sc_off3, sc_off4, sc_off5, sc_off6, sc_off7;
+    uint nq_off, nk_off, nv_off;
+    uint y0_off, y1_off, y2_off, y3_off, y4_off, y5_off, y6_off, y7_off;
+} pc;
+
+shared float s_lut[256];
+
+float decode_e4m3(uint code) {
+    uint sign = (code & 0x80u) << 24;
+    uint exp  = (code & 0x7Fu) >> 3;
+    uint man  = code & 7u;
+    if (exp != 0u) return uintBitsToFloat(sign | ((exp + 120u) << 23) | (man << 20));
+    float v = float(man) * (1.0 / 512.0);
+    return ((code & 0x80u) != 0u) ? -v : v;
+}
+
+vec4 unpack4(uint p) {
+    return vec4(s_lut[p & 255u], s_lut[(p >> 8) & 255u], s_lut[(p >> 16) & 255u], s_lut[(p >> 24) & 255u]);
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.y * 64u + gl_LocalInvocationID.x;
+    s_lut[lid] = decode_e4m3(lid);
+    barrier();
+
+    uint rg = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint w_o, sc_o, x_off, y_off, r;
+    if (rg < 3072u) {
+        w_o = pc.w_off0; sc_o = pc.sc_off0; x_off = pc.nq_off; y_off = pc.y0_off; r = rg;
+    } else if (rg < 4096u) {
+        w_o = pc.w_off1; sc_o = pc.sc_off1; x_off = pc.nk_off; y_off = pc.y1_off; r = rg - 3072u;
+    } else if (rg < 5120u) {
+        w_o = pc.w_off2; sc_o = pc.sc_off2; x_off = pc.nv_off; y_off = pc.y2_off; r = rg - 4096u;
+    } else if (rg < 5504u) {
+        w_o = pc.w_off3; sc_o = pc.sc_off3; x_off = pc.nq_off; y_off = pc.y3_off; r = rg - 5120u;
+    } else if (rg < 5528u) {
+        w_o = pc.w_off4; sc_o = pc.sc_off4; x_off = pc.nq_off; y_off = pc.y4_off; r = rg - 5504u;
+    } else if (rg < 8600u) {
+        w_o = pc.w_off5; sc_o = pc.sc_off5; x_off = pc.nq_off; y_off = pc.y5_off; r = rg - 5528u;
+    } else if (rg < 8632u) {
+        w_o = pc.w_off6; sc_o = pc.sc_off6; x_off = pc.nk_off; y_off = pc.y6_off; r = rg - 8600u;
+    } else if (rg < 8664u) {
+        w_o = pc.w_off7; sc_o = pc.sc_off7; x_off = pc.nv_off; y_off = pc.y7_off; r = rg - 8632u;
+    } else {
+        return;
+    }
+
+    const uint n_v16 = 144u; // 2304 / 16
+    UVec4In wbuf = UVec4In(pc.fp8_base + uint64_t(w_o) + uint64_t(r) * 2304ul);
+    Vec4In  xbuf = Vec4In(pc.s_base + uint64_t(x_off));
+
+    float acc = 0.0;
+    for (uint i = tid; i < n_v16; i += 64u) {
+        uvec4 w = wbuf.v[i];
+        uint xb = i << 2;
+        acc += dot(unpack4(w.x), xbuf.v[xb + 0u]) + dot(unpack4(w.y), xbuf.v[xb + 1u])
+             + dot(unpack4(w.z), xbuf.v[xb + 2u]) + dot(unpack4(w.w), xbuf.v[xb + 3u]);
+    }
+    acc = subgroupAdd(acc);
+    if (tid == 0u) {
+        float sc = F32In(pc.fp8_base + uint64_t(sc_o)).v[r];
+        F32Out(pc.s_base + uint64_t(y_off)).v[r] = acc * sc;
+    }
+}

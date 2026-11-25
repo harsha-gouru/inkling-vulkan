@@ -1,0 +1,61 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U32Out { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t logits_addr;
+    uint64_t bias_addr;
+    uint64_t ids_addr;
+    uint64_t weights_addr;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    F32In lb = F32In(pc.logits_addr);
+    F32In bb = F32In(pc.bias_addr);
+
+    uint e0 = tid;
+    uint e1 = tid + 64u;
+    float p0 = 1.0 / (1.0 + exp(-lb.v[e0]));
+    float p1 = 1.0 / (1.0 + exp(-lb.v[e1]));
+    float s0 = p0 + bb.v[e0];
+    float s1 = p1 + bb.v[e1];
+
+    uint  top_id[8];
+    float top_p[8];
+    float w_sum = 0.0;
+
+    for (uint k = 0u; k < 8u; ++k) {
+        bool pick0 = (s0 >= s1);
+        float my_s = pick0 ? s0 : s1;
+        uint  my_e = pick0 ? e0 : e1;
+
+        float gmax = subgroupMax(my_s);
+        uint cand = (my_s == gmax) ? my_e : 0xFFFFFFFFu;
+        uint best_e = subgroupMin(cand);
+
+        // Broadcast winning unbiased prob p
+        float my_p = (best_e == e0) ? p0 : ((best_e == e1) ? p1 : 0.0);
+        float best_p = subgroupAdd(my_p);
+
+        if (best_e == e0) s0 = -1e30;
+        if (best_e == e1) s1 = -1e30;
+
+        top_id[k] = best_e;
+        top_p[k]  = best_p;
+        w_sum += best_p;
+    }
+
+    if (tid < 8u) {
+        float scale = 8.0 / (w_sum + 1e-20);
+        U32Out(pc.ids_addr).v[tid]     = top_id[tid];
+        F32Out(pc.weights_addr).v[tid] = top_p[tid] * scale;
+    }
+}

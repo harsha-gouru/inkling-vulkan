@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Grid: (n_heads, B, 1), 64 threads (handles head_dim=128 -> 2 elements/thread: i and i+64!)
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4)           buffer F32RW  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32In  { uint  v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t x_addr;       // [B, n_heads, 128]
+    uint64_t norm_w_addr;  // BF16 [128]
+    uint64_t v_in_addr;    // optional V to also store into kv cache (0 if Q/draft K)
+    uint64_t k_cache_addr; // optional K cache [cap, 8, 128] (0 if in-place)
+    uint64_t v_cache_addr; // optional V cache [cap, 8, 128]
+    uint n_heads;
+    uint pos_start;
+    uint ring_mask;        // 0 for linear, 1023 for SWA
+} pc;
+
+float read_bf16(U32In buf, uint idx) {
+    uint p = buf.v[idx >> 1];
+    uint bits = ((idx & 1u) == 0u) ? ((p & 0xFFFFu) << 16) : (p & 0xFFFF0000u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint t   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x; // 0..63
+    uint base = (t * pc.n_heads + h) * 128u;
+
+    F32RW xb = F32RW(pc.x_addr);
+    U32In nw = U32In(pc.norm_w_addr);
+
+    float a = xb.v[base + tid];
+    float b = xb.v[base + tid + 64u];
+    float inv = inversesqrt(subgroupAdd(a*a + b*b) / 128.0 + 1e-6);
+    a = a * inv * read_bf16(nw, tid);
+    b = b * inv * read_bf16(nw, tid + 64u);
+
+    uint pos = pc.pos_start + t;
+    float ang = float(pos) * pow(1000000.0, -2.0 * float(tid) / 128.0);
+    float c = cos(ang), s = sin(ang);
+    float ra = a * c - b * s;
+    float rb = a * s + b * c;
+
+    if (pc.k_cache_addr != 0ul) {
+        uint phys = (pc.ring_mask != 0u) ? (pos & pc.ring_mask) : pos;
+        uint dst = (phys * pc.n_heads + h) * 128u;
+        F32Out(pc.k_cache_addr).v[dst + tid]       = ra;
+        F32Out(pc.k_cache_addr).v[dst + tid + 64u] = rb;
+        if (pc.v_cache_addr != 0ul) {
+            F32In vin = F32In(pc.v_in_addr);
+            F32Out(pc.v_cache_addr).v[dst + tid]       = vin.v[base + tid];
+            F32Out(pc.v_cache_addr).v[dst + tid + 64u] = vin.v[base + tid + 64u];
+        }
+    } else {
+        xb.v[base + tid]       = ra;
+        xb.v[base + tid + 64u] = rb;
+    }
+}

@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 128) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer U32In  { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U32Out { uint v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t ids_addr;      // [B * 8]
+    uint64_t counts_addr;   // [128]
+    uint64_t offsets_addr;  // [256]: [0..127] = offsets, [128..255] = compacted active expert IDs (0xFFFFFFFF = end)
+    uint64_t pair_tok_addr; // [B * 8]
+    uint64_t pair_k_addr;   // [B * 8]
+    uint B;
+} pc;
+
+shared uint s_cnt[128];
+shared uint s_off[128];
+shared uint s_act[128];
+
+void main() {
+    uint e = gl_LocalInvocationID.x;
+    U32In ids = U32In(pc.ids_addr);
+    uint total_pairs = pc.B * 8u;
+
+    uint cnt = 0u;
+    for (uint i = 0u; i < total_pairs; ++i) {
+        if (ids.v[i] == e) cnt++;
+    }
+    s_cnt[e] = cnt;
+    s_act[e] = 0xFFFFFFFFu;
+    barrier();
+
+    if (e == 0u) {
+        uint off = 0u;
+        uint na = 0u;
+        for (uint i = 0u; i < 128u; ++i) {
+            s_off[i] = off;
+            if (s_cnt[i] > 0u) {
+                s_act[na++] = i;
+                off += s_cnt[i];
+            }
+        }
+    }
+    barrier();
+
+    U32Out(pc.counts_addr).v[e]         = cnt;
+    U32Out(pc.offsets_addr).v[e]        = s_off[e];
+    U32Out(pc.offsets_addr).v[128u + e] = s_act[e];
+
+    uint wpos = s_off[e];
+    U32Out pt = U32Out(pc.pair_tok_addr);
+    U32Out pk = U32Out(pc.pair_k_addr);
+    for (uint i = 0u; i < total_pairs; ++i) {
+        if (ids.v[i] == e) {
+            pt.v[wpos] = i >> 3;
+            pk.v[wpos] = i & 7u;
+            wpos++;
+        }
+    }
+}

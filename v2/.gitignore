@@ -1,0 +1,12 @@
+inkling_vk
+inkling_vk_stage2
+vk_probe
+ref_cpu
+bench_ops
+shaders/*.spv
+__pycache__/
+*.pyc
+*.log
+*.bin
+*.out
+*.err

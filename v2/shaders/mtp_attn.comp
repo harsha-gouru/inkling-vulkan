@@ -1,0 +1,71 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Grid: (N_HEADS=24, BS=8, 1), 64 threads
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly  buffer F32In  { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Out { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t q_addr;       // [BS, 24, 128]
+    uint64_t kc_addr;      // [cap, 8, 128]
+    uint64_t vc_addr;      // [cap, 8, 128]
+    uint64_t kd_addr;      // [BS, 8, 128]
+    uint64_t vd_addr;      // [BS, 8, 128]
+    uint64_t out_addr;     // [BS, 24, 128]
+    uint ctx_len;
+    uint bs;
+    uint ring_mask;        // 0 for Global (layer 1), 1023 for SWA (layers 0, 2)
+} pc;
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint t   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint kvh = h / 3u;
+    uint d0 = tid, d1 = tid + 64u;
+
+    F32In qb = F32In(pc.q_addr + uint64_t(t) * 3072ul * 4ul);
+    float q0 = qb.v[h * 128u + d0];
+    float q1 = qb.v[h * 128u + d1];
+
+    F32In kc = F32In(pc.kc_addr);
+    F32In vc = F32In(pc.vc_addr);
+    F32In kd = F32In(pc.kd_addr);
+    F32In vd = F32In(pc.vd_addr);
+
+    uint start_j = (pc.ring_mask != 0u && pc.ctx_len > 1024u) ? (pc.ctx_len - 1024u) : 0u;
+    float m = -1e30, l = 0.0, acc0 = 0.0, acc1 = 0.0;
+    const float sc = inversesqrt(128.0);
+
+    for (uint j = start_j; j < pc.ctx_len; ++j) {
+        uint phys = (pc.ring_mask != 0u) ? (j & pc.ring_mask) : j;
+        uint b = phys * 1024u + kvh * 128u;
+        float s = subgroupAdd(q0 * kc.v[b + d0] + q1 * kc.v[b + d1]) * sc;
+        float m_new = max(m, s);
+        float alpha = (l > 0.0) ? exp(m - m_new) : 0.0;
+        float p = exp(s - m_new);
+        l = l * alpha + p;
+        acc0 = acc0 * alpha + p * vc.v[b + d0];
+        acc1 = acc1 * alpha + p * vc.v[b + d1];
+        m = m_new;
+    }
+    for (uint j = 0u; j < pc.bs; ++j) {
+        uint b = j * 1024u + kvh * 128u;
+        float s = subgroupAdd(q0 * kd.v[b + d0] + q1 * kd.v[b + d1]) * sc;
+        float m_new = max(m, s);
+        float alpha = (l > 0.0) ? exp(m - m_new) : 0.0;
+        float p = exp(s - m_new);
+        l = l * alpha + p;
+        acc0 = acc0 * alpha + p * vd.v[b + d0];
+        acc1 = acc1 * alpha + p * vd.v[b + d1];
+        m = m_new;
+    }
+
+    float inv_l = 1.0 / l;
+    F32Out ob = F32Out(pc.out_addr + uint64_t(t) * 3072ul * 4ul);
+    ob.v[h * 128u + d0] = acc0 * inv_l;
+    ob.v[h * 128u + d1] = acc1 * inv_l;
+}
